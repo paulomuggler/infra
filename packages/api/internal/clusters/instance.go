@@ -22,9 +22,9 @@ import (
 const (
 	// maxSyncFailuresBeforeUnhealthy defines the number of consecutive sync failures
 	// before an instance is marked as unhealthy.
-	maxSyncFailuresBeforeUnhealthy = 3
+	maxSyncFailuresBeforeUnhealthy = 10
 
-	maxInstanceSyncCallTimeout = 1 * time.Second
+	maxInstanceSyncCallTimeout = 3 * time.Second
 )
 
 type Instance struct {
