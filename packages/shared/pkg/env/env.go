@@ -3,6 +3,7 @@ package env
 import (
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -41,6 +42,36 @@ func GetEnvAsInt(key string, defaultValue int) (int, error) {
 	}
 
 	return defaultValue, nil
+}
+
+// GetEnvAsDuration returns the env var parsed as a time.Duration, or the default
+// if the var is unset or cannot be parsed.
+func GetEnvAsDuration(key string, defaultValue time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return defaultValue
+		}
+
+		return d
+	}
+
+	return defaultValue
+}
+
+// GetEnvAsIntDefault returns the env var parsed as an int, or the default
+// if the var is unset or cannot be parsed.
+func GetEnvAsIntDefault(key string, defaultValue int) int {
+	if v := os.Getenv(key); v != "" {
+		value, err := strconv.Atoi(v)
+		if err != nil {
+			return defaultValue
+		}
+
+		return value
+	}
+
+	return defaultValue
 }
 
 func GetNodeID() string {

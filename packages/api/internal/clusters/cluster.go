@@ -18,6 +18,7 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	api "github.com/e2b-dev/infra/packages/shared/pkg/http/edge"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -30,9 +31,9 @@ import (
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/clusters")
 
-const (
-	instancesSyncInterval = 5 * time.Second
-	instancesSyncTimeout  = 5 * time.Second
+var (
+	instancesSyncInterval = env.GetEnvAsDuration("E2B_INSTANCES_SYNC_INTERVAL", 5*time.Second)
+	instancesSyncTimeout  = env.GetEnvAsDuration("E2B_INSTANCES_SYNC_TIMEOUT", 5*time.Second)
 )
 
 type Cluster struct {

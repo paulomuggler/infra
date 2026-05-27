@@ -18,6 +18,7 @@ import (
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	clustersshared "github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	templatemanagergrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -52,9 +53,7 @@ type DeleteBuild struct {
 	NodeID    string
 }
 
-const (
-	syncInterval = time.Minute * 1
-)
+var syncInterval = env.GetEnvAsDuration("E2B_TEMPLATE_MANAGER_SYNC_INTERVAL", 1*time.Minute)
 
 func New(
 	sqlcDB *sqlcdb.Client,
