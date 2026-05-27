@@ -8,10 +8,11 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 )
 
-const syncMaxRetries = 4
+var syncMaxRetries = env.GetEnvAsIntDefault("E2B_NODE_SYNC_MAX_RETRIES", 4)
 
 func (n *Node) Sync(ctx context.Context, store *sandbox.Store) {
 	syncRetrySuccess := false

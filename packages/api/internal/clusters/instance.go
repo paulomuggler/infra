@@ -13,18 +13,19 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
-const (
+var (
 	// maxSyncFailuresBeforeUnhealthy defines the number of consecutive sync failures
 	// before an instance is marked as unhealthy.
-	maxSyncFailuresBeforeUnhealthy = 3
+	maxSyncFailuresBeforeUnhealthy = env.GetEnvAsIntDefault("E2B_INSTANCE_SYNC_MAX_FAILURES", 3)
 
-	maxInstanceSyncCallTimeout = 1 * time.Second
+	maxInstanceSyncCallTimeout = env.GetEnvAsDuration("E2B_INSTANCE_SYNC_CALL_TIMEOUT", 1*time.Second)
 )
 
 type Instance struct {

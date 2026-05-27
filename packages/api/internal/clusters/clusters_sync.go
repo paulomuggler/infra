@@ -14,6 +14,7 @@ import (
 	"github.com/e2b-dev/infra/packages/db/client"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
@@ -21,9 +22,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
-const (
-	clustersSyncInterval = 15 * time.Second
-	clusterSyncTimeout   = 5 * time.Second
+var (
+	clustersSyncInterval = env.GetEnvAsDuration("E2B_CLUSTERS_SYNC_INTERVAL", 15*time.Second)
+	clusterSyncTimeout   = env.GetEnvAsDuration("E2B_CLUSTER_SYNC_TIMEOUT", 5*time.Second)
 )
 
 type Pool struct {
