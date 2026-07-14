@@ -26,4 +26,16 @@
     <listen_host>0.0.0.0</listen_host>
 
     <tcp_port>${PORT}</tcp_port>
+    <!-- Bound ClickHouse's own system logs: they grow unbounded by default
+         (reached 8G here before TTLs were added 2026-07-14). Config ttl applies
+         when tables are created (fresh volume); the live tables carry the same
+         TTL via ALTER. -->
+    <query_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></query_log>
+    <trace_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></trace_log>
+    <text_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></text_log>
+    <metric_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></metric_log>
+    <asynchronous_metric_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></asynchronous_metric_log>
+    <latency_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></latency_log>
+    <part_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></part_log>
+    <query_views_log><ttl>event_date + INTERVAL 15 DAY DELETE</ttl></query_views_log>
 </clickhouse>
