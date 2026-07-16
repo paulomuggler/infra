@@ -67,6 +67,13 @@ type Config struct {
 	SandboxTCPFirewallHTTPPort  uint16 `env:"SANDBOX_TCP_FIREWALL_HTTP_PORT"  envDefault:"5016"`
 	SandboxTCPFirewallTLSPort   uint16 `env:"SANDBOX_TCP_FIREWALL_TLS_PORT"   envDefault:"5017"`
 	SandboxTCPFirewallOtherPort uint16 `env:"SANDBOX_TCP_FIREWALL_OTHER_PORT" envDefault:"5018"`
+
+	// SandboxAllowedEgressCIDRs is an operator-configured allow-list of IPs or
+	// CIDRs that sandboxes may always reach, in addition to the orchestrator
+	// internal IP. It punches narrow holes in the deny-by-default RFC1918 block
+	// for specific trusted LAN service endpoints (e.g. NATS, Dolt, an egress
+	// proxy). All other private-range destinations stay blocked. Comma-separated.
+	SandboxAllowedEgressCIDRs []string `env:"SANDBOX_ALLOWED_EGRESS_CIDRS"`
 }
 
 func ParseConfig() (Config, error) {

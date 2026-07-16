@@ -35,7 +35,20 @@ type Firewall struct {
 	allowedRanges []string
 }
 
-func NewFirewall(tapIf string, orchestratorInternalIP string) (*Firewall, error) {
+func NewFirewall(tapIf string, orchestratorInternalIP string, extraAllowedRanges []string) (*Firewall, error) {
+	// The orchestrator internal IP is always reachable. Operators may allow-list
+	// additional trusted LAN service endpoints (SANDBOX_ALLOWED_EGRESS_CIDRS) to
+	// punch narrow holes in the deny-by-default RFC1918 block; every other
+	// private-range destination stays denied.
+	allowedRanges := []string{fmt.Sprintf("%s/32", orchestratorInternalIP)}
+	for _, r := range extraAllowedRanges {
+		cidr := sandbox_network.AddressStringToCIDR(r)
+		if !sandbox_network.IsSpecifiedIPOrCIDR(cidr) {
+			return nil, fmt.Errorf("invalid sandbox allowed egress CIDR %q", r)
+		}
+		allowedRanges = append(allowedRanges, cidr)
+	}
+
 	conn, err := nftables.New(nftables.AsLasting())
 	if err != nil {
 		return nil, fmt.Errorf("new nftables conn: %w", err)
@@ -85,7 +98,7 @@ func NewFirewall(tapIf string, orchestratorInternalIP string) (*Firewall, error)
 		userDenySet:        denySet,
 		userAllowSet:       allowSet,
 		tapInterface:       tapIf,
-		allowedRanges:      []string{fmt.Sprintf("%s/32", orchestratorInternalIP)},
+		allowedRanges:      allowedRanges,
 		filterChain:        filterChain,
 	}
 
