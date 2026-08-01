@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/proxy"
@@ -140,6 +141,7 @@ func (lb *LayerExecutor) BuildLayer(
 		sbx,
 		cmd.Hash,
 		meta,
+		lb.Config.SnapshotPolicy.PersistMemfile(cmd.IsFinalLayer),
 	)
 	if err != nil {
 		return metadata.Template{}, fmt.Errorf("pause and upload: %w", err)
@@ -235,22 +237,40 @@ func (lb *LayerExecutor) updateEnvdInSandbox(
 	return nil
 }
 
+// PauseAndUpload pauses the VM, hands the snapshot to the in-process template
+// cache so the next layer can resume from it, and uploads it in the background.
+//
+// persistMemfile decides whether the RAM half of that snapshot reaches template
+// storage. When it is false the layer keeps its rootfs diff, its snapfile and
+// its metadata but writes no memfile, and its metadata records that so a reader
+// finding no RAM image knows it is absent by design rather than lost. Skipping
+// the upload does not affect this build: the snapshot is still in the template
+// cache, which is what the next layer resumes from.
 func (lb *LayerExecutor) PauseAndUpload(
 	ctx context.Context,
 	userLogger logger.Logger,
 	sbx *sandbox.Sandbox,
 	hash string,
 	meta metadata.Template,
+	persistMemfile bool,
 ) (e error) {
 	ctx, childSpan := tracer.Start(ctx, "pause-and-upload")
 	defer childSpan.End()
 
+	childSpan.SetAttributes(attribute.Bool("persist_memfile", persistMemfile))
+
 	userLogger.Debug(ctx, fmt.Sprintf("Processing layer: %s", meta.Template.BuildID))
+
+	// The metadata written into the snapshot is the persisted record of this
+	// layer; the copy the build carries on is untouched, so the marker never
+	// leaks into a later layer.
+	persistedMeta := meta
+	persistedMeta.MemfileOmitted = !persistMemfile
 
 	// snapshot is automatically cleared by the templateCache eviction
 	snapshot, err := sbx.Pause(
 		ctx,
-		meta,
+		persistedMeta,
 	)
 	if err != nil {
 		return fmt.Errorf("error processing vm: %w", err)
@@ -293,6 +313,7 @@ func (lb *LayerExecutor) PauseAndUpload(
 			ctx,
 			lb.templateStorage,
 			storage.Paths{BuildID: meta.Template.BuildID},
+			persistMemfile,
 		)
 		if err != nil {
 			return fmt.Errorf("error uploading snapshot: %w", err)

@@ -2,6 +2,7 @@ package config
 
 import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci/auth"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/snapshotpolicy"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
@@ -25,6 +26,11 @@ type TemplateConfig struct {
 
 	// CacheScope is the scope of layers and files caches.
 	CacheScope string
+
+	// SnapshotPolicy decides which of this build's layers persist their VM RAM
+	// image. Resolved from the build request, falling back to the orchestrator's
+	// TEMPLATE_SNAPSHOT_POLICY setting.
+	SnapshotPolicy snapshotpolicy.Policy
 
 	// Command to run when building the template.
 	StartCmd string

@@ -183,6 +183,13 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 		)
 
 		if memfileErr != nil {
+			// A build made under a leaf-only snapshot policy has no RAM image,
+			// and says so in its own metadata. Report that instead of a bare
+			// not-found, which reads as a corrupt build.
+			if t.memfileOmittedByPolicy() {
+				memfileErr = ErrMemfileOmitted
+			}
+
 			errMsg := fmt.Errorf("failed to create memfile storage: %w", memfileErr)
 
 			if err := t.memfile.SetError(errMsg); err != nil {
@@ -238,6 +245,22 @@ func (t *storageTemplate) Fetch(ctx context.Context, buildStore *build.DiffStore
 
 		return
 	}
+}
+
+// ErrMemfileOmitted is returned for a build whose VM RAM image was never
+// persisted because it was not the final layer of its template.
+var ErrMemfileOmitted = errors.New("build has no memfile: it was not the final layer of its template and was built under the leaf-only snapshot policy; boot from its rootfs instead of resuming")
+
+// memfileOmittedByPolicy reports whether this build's own metadata says its RAM
+// image was deliberately not persisted. Consulted only once the memfile has
+// already failed to load, so it costs nothing on the normal path.
+func (t *storageTemplate) memfileOmittedByPolicy() bool {
+	meta, err := t.Metadata()
+	if err != nil {
+		return false
+	}
+
+	return meta.MemfileOmitted
 }
 
 func (t *storageTemplate) Close(ctx context.Context) error {

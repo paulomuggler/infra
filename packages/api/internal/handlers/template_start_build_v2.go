@@ -30,6 +30,12 @@ import (
 const (
 	jsSDKPrefix     = "e2b-js-sdk/"
 	pythonSDKPrefix = "e2b-python-sdk/"
+
+	// snapshotPolicyHeader lets a single build override the builder's snapshot
+	// policy ("leaf-only" or "all-layers"). It rides on a header rather than the
+	// request body so a caller can set it through the SDK's existing custom
+	// headers, without the SDK having to grow a build option for it.
+	snapshotPolicyHeader = "X-E2B-Snapshot-Policy"
 )
 
 type dockerfileStore struct {
@@ -136,6 +142,13 @@ func (a *APIStore) PostV2TemplatesTemplateIDBuildsBuildID(c *gin.Context, templa
 		return
 	}
 
+	// Left nil when unset so the builder applies its own default; the builder
+	// validates the value and refuses an unknown one.
+	var snapshotPolicy *string
+	if v := strings.TrimSpace(c.GetHeader(snapshotPolicyHeader)); v != "" {
+		snapshotPolicy = &v
+	}
+
 	builderNode, err := a.templateManager.GetAvailableBuildClient(ctx, clusters.WithClusterFallback(team.ClusterID))
 	if err != nil {
 		a.sendAPIStoreError(c, http.StatusServiceUnavailable, "Error when getting available build client")
@@ -186,6 +199,7 @@ func (a *APIStore) PostV2TemplatesTemplateIDBuildsBuildID(c *gin.Context, templa
 		clusters.WithClusterFallback(team.ClusterID),
 		builderNode.NodeID,
 		version,
+		snapshotPolicy,
 	)
 
 	a.posthog.CreateAnalyticsTeamEvent(ctx, team.ID.String(), "built environment", posthog.NewProperties().

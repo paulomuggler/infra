@@ -18,6 +18,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/buildlogger"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/config"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci/auth"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/snapshotpolicy"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -77,6 +78,14 @@ func (s *ServerStore) TemplateCreate(ctx context.Context, templateRequest *templ
 		cacheScope = templateRequest.GetCacheScope()
 	}
 
+	// Snapshot policy: the build may override the host-wide default, e.g. a
+	// template-iteration workflow asking for all-layers so cache resumes stay
+	// warm. An unparseable value is refused rather than silently defaulted.
+	snapshotPolicy, err := s.resolveSnapshotPolicy(templateRequest.GetSnapshotPolicy())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	// Create the auth provider using the factory
 	authProvider := auth.NewAuthProvider(cfg.GetFromImageRegistry())
 
@@ -95,6 +104,7 @@ func (s *ServerStore) TemplateCreate(ctx context.Context, templateRequest *templ
 		TeamID:               cfg.GetTeamID(),
 		TemplateID:           cfg.GetTemplateID(),
 		CacheScope:           cacheScope,
+		SnapshotPolicy:       snapshotPolicy,
 		VCpuCount:            int64(cfg.GetVCpuCount()),
 		MemoryMB:             int64(cfg.GetMemoryMB()),
 		StartCmd:             cfg.GetStartCommand(),
@@ -190,6 +200,21 @@ func (s *ServerStore) TemplateCreate(ctx context.Context, templateRequest *templ
 	}(context.WithoutCancel(ctx))
 
 	return nil, nil
+}
+
+// resolveSnapshotPolicy takes the build's requested policy when it names one and
+// the orchestrator's configured default otherwise.
+func (s *ServerStore) resolveSnapshotPolicy(requested string) (snapshotpolicy.Policy, error) {
+	p, err := snapshotpolicy.Parse(requested)
+	if err != nil {
+		return "", err
+	}
+
+	if p != "" {
+		return p, nil
+	}
+
+	return s.builderConfig.SnapshotPolicy()
 }
 
 // checkBuildDiskSpace refuses when any filesystem a template build writes to is

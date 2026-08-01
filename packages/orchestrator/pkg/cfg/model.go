@@ -12,6 +12,7 @@ import (
 	"github.com/willscott/go-nfs"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/snapshotpolicy"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
@@ -38,10 +39,29 @@ type BuilderConfig struct {
 	// admitted. Set to 0 to disable the guard. See pkg/diskguard.
 	TemplateBuildMinFreeDiskGB int64 `env:"TEMPLATE_BUILD_MIN_FREE_DISK_GB" envDefault:"50"`
 
+	// TemplateSnapshotPolicy is the host-wide default for which of a build's
+	// layers persist their VM RAM image: "leaf-only" or "all-layers". A build
+	// may override it per request. See pkg/template/snapshotpolicy.
+	TemplateSnapshotPolicy string `env:"TEMPLATE_SNAPSHOT_POLICY" envDefault:"leaf-only"`
+
 	Provider string `env:"PROVIDER" envDefault:"gcp"`
 
 	StorageConfig storage.Config
 	NetworkConfig network.Config
+}
+
+// SnapshotPolicy is the validated host-wide default snapshot policy.
+func (c BuilderConfig) SnapshotPolicy() (snapshotpolicy.Policy, error) {
+	p, err := snapshotpolicy.Parse(c.TemplateSnapshotPolicy)
+	if err != nil {
+		return "", fmt.Errorf("invalid TEMPLATE_SNAPSHOT_POLICY: %w", err)
+	}
+
+	if p == "" {
+		return snapshotpolicy.Default, nil
+	}
+
+	return p, nil
 }
 
 // TemplateBuildMinFreeDiskBytes is the free-space floor in bytes, 0 when the
@@ -149,6 +169,10 @@ func Parse() (Config, error) {
 
 	config.BuilderConfig = bc
 
+	if _, err = bc.SnapshotPolicy(); err != nil {
+		return config, err
+	}
+
 	if config.PersistentVolumeMounts != nil {
 		for name, path := range config.PersistentVolumeMounts {
 			path = filepath.Clean(path)
@@ -175,6 +199,10 @@ func ParseBuilder() (BuilderConfig, error) {
 	}
 
 	if err = makePathsAbsolute(&model); err != nil {
+		return BuilderConfig{}, err
+	}
+
+	if _, err = model.SnapshotPolicy(); err != nil {
 		return BuilderConfig{}, err
 	}
 

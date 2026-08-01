@@ -208,6 +208,7 @@ func (a *APIStore) PostTemplatesTemplateIDBuildsBuildID(c *gin.Context, template
 		apiutils.WithClusterFallback(team.ClusterID),
 		builderNode.NodeID,
 		templates.TemplateV1Version,
+		nil, // snapshot policy override not supported in v1 handler
 	)
 
 	a.posthog.CreateAnalyticsUserEvent(ctx, userID.String(), team.ID.String(), "built environment", posthog.NewProperties().

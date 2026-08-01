@@ -182,7 +182,14 @@ func (ppb *PostProcessingBuilder) Build(
 		sandboxOptions = append(sandboxOptions, layer.ReservedBlocksOptions(ctx, ppb.featureFlags, ppb.Config.RootfsBlockSize())...)
 	}
 
-	// Always restart the sandbox for the final layer to properly wire the rootfs path for the final template
+	// Always restart the sandbox for the final layer to properly wire the rootfs path for the final template.
+	//
+	// This cold boot is load-bearing for the leaf-only snapshot policy: because
+	// the final VM starts from an empty memfile, every page of its RAM image is
+	// either written by this boot or empty, so the memfile header it produces
+	// maps nothing from an ancestor's memfile. That is what makes it safe for
+	// the layers below to persist no memfile at all. Do not turn this into a
+	// resume without revisiting pkg/template/snapshotpolicy.
 	sandboxCreator := layer.NewCreateSandbox(
 		sbxConfig,
 		ppb.sandboxFactory,
@@ -204,6 +211,7 @@ func (ppb *PostProcessingBuilder) Build(
 			UpdateEnvd:     sourceLayer.Cached,
 			SandboxCreator: sandboxCreator,
 			ActionExecutor: actionExecutor,
+			IsFinalLayer:   true,
 		},
 	)
 	if err != nil {

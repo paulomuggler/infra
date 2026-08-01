@@ -109,6 +109,17 @@ type Template struct {
 	FromImage    *string          `json:"from_image,omitempty"`
 	FromTemplate *FromTemplate    `json:"from_template,omitempty"`
 	Prefetch     *Prefetch        `json:"prefetch,omitempty"`
+
+	// MemfileOmitted marks a build whose VM RAM image was deliberately not
+	// persisted, under a snapshot policy that keeps only the final layer's
+	// memfile (see pkg/template/snapshotpolicy). The absence of the memfile and
+	// memfile.header objects for such a build is by design, not data loss:
+	// anything needing this build's state must cold-boot from its rootfs.
+	//
+	// It is never set on a template's final build, which sandboxes boot from,
+	// and it is deliberately not carried by NewVersionTemplate/BasedOn/
+	// WithPrefetch — each layer records its own storage, not its ancestor's.
+	MemfileOmitted bool `json:"memfile_omitted,omitempty"`
 }
 
 func V1TemplateVersion() Template {

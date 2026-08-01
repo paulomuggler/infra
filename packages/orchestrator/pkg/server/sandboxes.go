@@ -667,7 +667,9 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 		defer cancel()
 		defer res.completeUpload(uploadCtx)
 
-		if err := res.snapshot.Upload(uploadCtx, s.persistence, res.paths); err != nil {
+		// A paused sandbox IS its RAM image, so it always persists one; the
+		// leaf-only template snapshot policy governs build layers only.
+		if err := res.snapshot.Upload(uploadCtx, s.persistence, res.paths, true); err != nil {
 			telemetry.ReportCriticalError(ctx, "error uploading snapshot for checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 			s.sandboxFactory.Sandboxes.MarkStopping(ctx, resumedSbx.Runtime.SandboxID, resumedSbx.LifecycleID)
@@ -808,7 +810,8 @@ func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, 
 		defer cancel()
 		defer res.completeUpload(ctx)
 
-		err := res.snapshot.Upload(ctx, s.persistence, res.paths)
+		// Always persist: without its RAM image a paused sandbox cannot resume.
+		err := res.snapshot.Upload(ctx, s.persistence, res.paths, true)
 		if err != nil {
 			sbxlogger.I(sbx).Error(ctx, "error uploading snapshot files", zap.Error(err))
 

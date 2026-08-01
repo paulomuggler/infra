@@ -636,13 +636,13 @@ func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool)
 		paths := storage.Paths{BuildID: opts.newBuildID}
 		if opts.isRemoteStorage {
 			fmt.Println("📤 Uploading snapshot...")
-			if err := snapshot.Upload(ctx, r.storage, paths); err != nil {
+			if err := snapshot.Upload(ctx, r.storage, paths, true); err != nil {
 				return timings, fmt.Errorf("failed to upload snapshot: %w", err)
 			}
 			fmt.Println("✅ Snapshot uploaded successfully")
 		} else {
 			fmt.Println("💾 Saving snapshot to local storage...")
-			if err := snapshot.Upload(ctx, r.storage, paths); err != nil {
+			if err := snapshot.Upload(ctx, r.storage, paths, true); err != nil {
 				return timings, fmt.Errorf("failed to save snapshot: %w", err)
 			}
 			fmt.Println("✅ Snapshot saved successfully")

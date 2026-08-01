@@ -40,4 +40,8 @@ type LayerBuildCommand struct {
 	UpdateEnvd     bool
 	SandboxCreator SandboxCreator
 	ActionExecutor ActionExecutor
+
+	// IsFinalLayer marks the layer sandboxes boot from. Its memfile is always
+	// persisted; see pkg/template/snapshotpolicy.
+	IsFinalLayer bool
 }
