@@ -25,9 +25,14 @@ func closeTemplate(ctx context.Context, t Template) (e error) {
 	closable := make([]io.Closer, 0)
 
 	memfile, err := t.Memfile(ctx)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrMemfileOmitted):
+		// Nothing to close, and nothing wrong: this build never had a RAM image.
+		// Only a build whose own metadata says so reports this, so it cannot
+		// mask a genuinely missing memfile.
+	case err != nil:
 		e = errors.Join(e, err)
-	} else {
+	default:
 		closable = append(closable, memfile)
 	}
 
