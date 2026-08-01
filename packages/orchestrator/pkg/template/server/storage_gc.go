@@ -66,6 +66,16 @@ func (s *ServerStore) TemplateStorageCollect(
 	// the lock is back down, where it blocks nothing.
 	s.buildLock.Lock()
 	res, err := gc.Collect(ctx, cfg, roots)
+	if err == nil {
+		// The sandbox template cache is a cache, not an authority: it may hold
+		// an entry for a build that has just been collected, and a later hit on
+		// that entry would hand out a template whose backing files are gone.
+		// Dropping the entries here, still under the lock, means the cache can
+		// never outlive the store.
+		for _, c := range res.Collected {
+			s.templateCache.Invalidate(c.BuildID)
+		}
+	}
 	s.buildLock.Unlock()
 
 	if err != nil {
@@ -123,20 +133,21 @@ func (s *ServerStore) TemplateStorageCollect(
 //   - Every sandbox in the map, whatever its status: a sandbox pages its rootfs
 //     and memfile lazily from its build's layers for its whole life, so a
 //     supersede that happens mid-run must not take those layers away.
-//   - Every template held in the sandbox template cache (25 h TTL) — a template
-//     opened for a spawn.
-//   - Every build the template build cache still reports as building.
+//   - Every build the template build cache still reports as building. Builds
+//     also hold the build lock, so a pass cannot overlap one; this covers the
+//     directories a build has already written.
+//
+// The sandbox template cache is deliberately NOT a root. Its entries live 25
+// hours past their last use, which would pin every superseded build for a day
+// and make reactive collection pointless. It is also unnecessary: a spawn
+// resolves its build ID from the registry and a resume resolves it from the
+// snapshot, so every build the cache can be asked for is already a registry
+// root. Entries for collected builds are invalidated instead.
 func (s *ServerStore) liveRoots() []string {
 	var roots []string
 
 	if s.sandboxes != nil {
 		roots = append(roots, s.sandboxes.BuildIDs()...)
-	}
-
-	if s.templateCache != nil {
-		for buildID := range s.templateCache.Items() {
-			roots = append(roots, buildID)
-		}
 	}
 
 	roots = append(roots, s.buildCache.RunningBuildIDs()...)

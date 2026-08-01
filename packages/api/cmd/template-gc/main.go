@@ -32,21 +32,38 @@ import (
 
 const defaultTimeout = 30 * time.Minute
 
+// unsetMinAge is the sentinel for "let the builder decide", which is the normal
+// case. A literal 0 is meaningful and different: it drops the age floor
+// entirely, which is how a proof run collects something minted minutes ago.
+const unsetMinAge = -1 * time.Second
+
+func minAgeOverride(d time.Duration) *uint64 {
+	if d < 0 {
+		return nil
+	}
+
+	seconds := uint64(d.Seconds())
+
+	return &seconds
+}
+
 func main() {
 	dryRun := flag.Bool("dry-run", false, "report what would be collected without deleting anything")
 	builder := flag.String("builder", env.GetEnv("TEMPLATE_GC_BUILDER_ADDR", "localhost:5008"),
 		"address of the builder's template-manager gRPC service")
 	reason := flag.String("reason", "periodic", "recorded in the ledger and the log line")
 	timeout := flag.Duration("timeout", defaultTimeout, "overall deadline for the pass")
+	minAge := flag.Duration("min-age", unsetMinAge,
+		"protect directories modified more recently than this; unset uses the builder's TEMPLATE_GC_MIN_AGE")
 	flag.Parse()
 
-	if err := run(*builder, *reason, *dryRun, *timeout); err != nil {
+	if err := run(*builder, *reason, *dryRun, *timeout, *minAge); err != nil {
 		fmt.Fprintf(os.Stderr, "template-gc: %s\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(builderAddr, reason string, dryRun bool, timeout time.Duration) error {
+func run(builderAddr, reason string, dryRun bool, timeout, minAge time.Duration) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -72,7 +89,7 @@ func run(builderAddr, reason string, dryRun bool, timeout time.Duration) error {
 
 	client := templatemanagergrpc.NewTemplateServiceClient(conn)
 
-	res, err := templatemanager.CollectStorageWithClient(ctx, db, client, reason, dryRun)
+	res, err := templatemanager.CollectStorageWithClient(ctx, db, client, reason, dryRun, minAgeOverride(minAge))
 	if err != nil {
 		return err
 	}

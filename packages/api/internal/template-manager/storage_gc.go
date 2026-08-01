@@ -58,6 +58,7 @@ func CollectStorageWithClient(
 	client templatemanagergrpc.TemplateServiceClient,
 	reason string,
 	dryRun bool,
+	minAgeSeconds *uint64,
 ) (*templatemanagergrpc.TemplateStorageCollectResponse, error) {
 	roots, err := StorageGCRoots(ctx, db)
 	if err != nil {
@@ -65,9 +66,10 @@ func CollectStorageWithClient(
 	}
 
 	res, err := client.TemplateStorageCollect(ctx, &templatemanagergrpc.TemplateStorageCollectRequest{
-		RootBuildIDs: roots,
-		DryRun:       dryRun,
-		Reason:       &reason,
+		RootBuildIDs:  roots,
+		DryRun:        dryRun,
+		Reason:        &reason,
+		MinAgeSeconds: minAgeSeconds,
 	})
 
 	err = utils.UnwrapGRPCError(err)
@@ -94,7 +96,7 @@ func (tm *TemplateManager) CollectStorage(
 		return nil, fmt.Errorf("failed to get builder client: %w", err)
 	}
 
-	res, err := CollectStorageWithClient(ctx, tm.sqlcDB, client.Template, reason, dryRun)
+	res, err := CollectStorageWithClient(ctx, tm.sqlcDB, client.Template, reason, dryRun, nil)
 	if err != nil {
 		return nil, fmt.Errorf("on node '%s': %w", nodeID, err)
 	}
