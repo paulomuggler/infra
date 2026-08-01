@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/diskguard"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/filesystem"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/oci/auth"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/units"
@@ -54,6 +55,50 @@ func (e *ImageTooLargeError) Error() string {
 			"Please reduce your Docker image size (e.g., use a smaller base image, multi-stage builds, or remove unnecessary files)",
 		humanize.Bytes(uint64(e.MaxSize)),
 	)
+}
+
+// HostDiskFullError is returned when a build write fails because the BUILD
+// HOST's filesystem is out of space. It exists because the same ENOSPC that
+// means "this image does not fit in the guest rootfs" also means "the machine
+// doing the building has no room left", and those two need opposite responses:
+// the first is the user's image to fix, the second is storage to reclaim on the
+// host. Reporting the second as the first sends operators to their Dockerfile
+// while the real fault is under their feet.
+type HostDiskFullError struct {
+	Path      string // filesystem that ran out
+	FreeBytes uint64
+	cause     error
+}
+
+func (e *HostDiskFullError) Error() string {
+	return fmt.Sprintf(
+		"the build host has run out of disk space: %s free on %s. "+
+			"This is not a problem with the image — storage must be reclaimed on the build host.",
+		humanize.IBytes(e.FreeBytes),
+		e.Path,
+	)
+}
+
+func (e *HostDiskFullError) Unwrap() error {
+	return e.cause
+}
+
+// classifyNoSpace attributes an ENOSPC raised while copying into the mounted
+// guest rootfs to whichever filesystem actually ran out. destDir is the guest
+// rootfs image mounted on the host; the image file itself lives on the host
+// filesystem, and either can be the one that is full. Whichever has less room
+// left is the one that failed the write.
+func classifyNoSpace(ctx context.Context, cause error, srcDir, destDir, hostRootfsPath string, maxSize int64) error {
+	guest, guestErr := diskguard.Stat(destDir)
+	host, hostErr := diskguard.Stat(filepath.Dir(hostRootfsPath))
+
+	if hostErr == nil && (guestErr != nil || host.FreeBytes <= guest.FreeBytes) {
+		return &HostDiskFullError{Path: host.Path, FreeBytes: host.FreeBytes, cause: cause}
+	}
+
+	imageSize, _ := getDirSize(ctx, srcDir)
+
+	return &ImageTooLargeError{ImageSize: imageSize, MaxSize: maxSize}
 }
 
 // DefaultPlatform returns the OCI platform for image pulls, respecting TARGET_ARCH.
@@ -252,7 +297,7 @@ func ExtractToExt4(ctx context.Context, l logger.Logger, img containerregistry.I
 		zap.String("tmp_mount", tmpMount),
 	)
 
-	err = unpackRootfs(ctx, l, img, tmpMount, maxSize)
+	err = unpackRootfs(ctx, l, img, tmpMount, rootfsPath, maxSize)
 	if err != nil {
 		return fmt.Errorf("error extracting tar to directory: %w", err)
 	}
@@ -280,7 +325,7 @@ func ParseEnvs(envs []string) map[string]string {
 	return envMap
 }
 
-func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregistry.Image, destDir string, maxSize int64) (err error) {
+func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregistry.Image, destDir string, hostRootfsPath string, maxSize int64) (err error) {
 	ctx, childSpan := tracer.Start(ctx, "unpack-rootfs")
 	defer childSpan.End()
 
@@ -328,9 +373,7 @@ func unpackRootfs(ctx context.Context, l logger.Logger, srcImage containerregist
 	err = copyFiles(ctx, mountPath, destDir)
 	if err != nil {
 		if strings.Contains(err.Error(), "No space left on device") {
-			imageSize, _ := getDirSize(ctx, mountPath)
-
-			return &ImageTooLargeError{ImageSize: imageSize, MaxSize: maxSize}
+			return classifyNoSpace(ctx, err, mountPath, destDir, hostRootfsPath, maxSize)
 		}
 
 		return fmt.Errorf("while copying files from overlayfs to destination directory: %w", err)

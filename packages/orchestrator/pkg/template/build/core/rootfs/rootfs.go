@@ -141,6 +141,16 @@ func (r *Rootfs) CreateExt4Filesystem(
 			return containerregistry.Config{}, phases.NewPhaseBuildError(phaseMetadata, imgErr)
 		}
 
+		// Surfaced the same way as an image-size error: not because the host
+		// running out of disk is the user's fault, but because this is the only
+		// path that puts a real message in the build log. Anything else reaches
+		// the caller as "an internal error occurred", which is exactly how a
+		// full disk stayed unreadable for hours during the 2026-08-01 outage.
+		var hostDiskErr *oci.HostDiskFullError
+		if errors.As(err, &hostDiskErr) {
+			return containerregistry.Config{}, phases.NewPhaseBuildError(phaseMetadata, hostDiskErr)
+		}
+
 		return containerregistry.Config{}, fmt.Errorf("error converting oci to ext4: %w", err)
 	}
 	telemetry.ReportEvent(childCtx, "created rootfs ext4 file")

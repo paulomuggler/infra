@@ -35,6 +35,7 @@ type ServerStore struct {
 	templatemanager.UnimplementedTemplateServiceServer
 
 	logger            logger.Logger
+	builderConfig     cfg.BuilderConfig
 	builder           *build.Builder
 	buildCache        *cache.BuildCache
 	buildLogger       logger.Logger
@@ -110,6 +111,7 @@ func New(
 
 	store := &ServerStore{
 		logger:            logger,
+		builderConfig:     config.BuilderConfig,
 		builder:           builder,
 		buildCache:        buildCache,
 		buildLogger:       buildLogger,

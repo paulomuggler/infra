@@ -33,10 +33,25 @@ type BuilderConfig struct {
 
 	DefaultCacheDir string `env:"DEFAULT_CACHE_DIR,expand" envDefault:"${ORCHESTRATOR_BASE_PATH}/build"`
 
+	// TemplateBuildMinFreeDiskGB is the free-space floor, in GiB, that the
+	// filesystems a template build writes to must be above for the build to be
+	// admitted. Set to 0 to disable the guard. See pkg/diskguard.
+	TemplateBuildMinFreeDiskGB int64 `env:"TEMPLATE_BUILD_MIN_FREE_DISK_GB" envDefault:"50"`
+
 	Provider string `env:"PROVIDER" envDefault:"gcp"`
 
 	StorageConfig storage.Config
 	NetworkConfig network.Config
+}
+
+// TemplateBuildMinFreeDiskBytes is the free-space floor in bytes, 0 when the
+// guard is disabled.
+func (c BuilderConfig) TemplateBuildMinFreeDiskBytes() uint64 {
+	if c.TemplateBuildMinFreeDiskGB <= 0 {
+		return 0
+	}
+
+	return uint64(c.TemplateBuildMinFreeDiskGB) << 30
 }
 
 func makePathsAbsolute(c *BuilderConfig) error {

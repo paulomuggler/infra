@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
+	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
@@ -194,6 +196,18 @@ func (a *APIStore) PostV2TemplatesTemplateIDBuildsBuildID(c *gin.Context, templa
 	)
 
 	if err != nil {
+		// A build host below its free-space floor is a capacity condition, not a
+		// server fault. Relay the node's own message under a storage status code
+		// so it stays readable at the client instead of arriving as a generic
+		// 500 the caller has to go spelunking for.
+		var diskErr *template_manager.InsufficientDiskError
+		if errors.As(err, &diskErr) {
+			telemetry.ReportError(ctx, "template build refused: build host low on disk", err, telemetry.WithTemplateID(templateID))
+			a.sendAPIStoreError(c, http.StatusInsufficientStorage, diskErr.Error())
+
+			return
+		}
+
 		telemetry.ReportCriticalError(ctx, "build failed", err, telemetry.WithTemplateID(templateID))
 		a.sendAPIStoreError(c, http.StatusInternalServerError, fmt.Sprintf("Error when starting template build: %s", err))
 

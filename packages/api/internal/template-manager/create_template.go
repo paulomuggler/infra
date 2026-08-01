@@ -9,6 +9,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
@@ -22,6 +24,19 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	ut "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+// InsufficientDiskError reports that the build node refused the build up front
+// because its filesystems are below the configured free-space floor. It is a
+// distinct type so the HTTP layer can answer with the node's own message and a
+// storage status code, rather than folding an operational capacity condition
+// into a generic server fault.
+type InsufficientDiskError struct {
+	message string
+}
+
+func (e *InsufficientDiskError) Error() string {
+	return e.message
+}
 
 type FromTemplateError struct {
 	err     error
@@ -158,6 +173,29 @@ func (tm *TemplateManager) CreateTemplate(
 			Version:    &version,
 		},
 	)
+
+	// The node refuses before writing anything when it is low on disk. Mark the
+	// build failed with its message — otherwise the row sits in `waiting`
+	// forever — and hand the condition up typed so the handler can say what
+	// actually happened.
+	if st, ok := status.FromError(err); err != nil && ok && st.Code() == codes.ResourceExhausted {
+		diskErr := &InsufficientDiskError{message: st.Message()}
+
+		statusErr := tm.SetStatus(
+			ctx,
+			buildID,
+			types.BuildStatusGroupFailed,
+			&templatemanagergrpc.TemplateBuildStatusReason{
+				Message: diskErr.Error(),
+				Step:    ut.ToPtr("base"),
+			},
+		)
+		if statusErr != nil {
+			return errors.Join(diskErr, fmt.Errorf("failed to set build status: %w", statusErr))
+		}
+
+		return diskErr
+	}
 
 	err = utils.UnwrapGRPCError(err)
 	if err != nil {
