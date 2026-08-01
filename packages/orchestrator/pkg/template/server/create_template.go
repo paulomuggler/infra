@@ -136,9 +136,15 @@ func (s *ServerStore) TemplateCreate(ctx context.Context, templateRequest *templ
 		}),
 	)
 
+	// Held until the build goroutine finishes. Storage GC takes this lock for
+	// write, so a collection pass never overlaps a build's writes or its
+	// upload, and a build never starts on a store mid-collection.
+	s.buildLock.RLock()
+
 	s.wg.Add(1)
 	s.activeBuilds.Add(1)
 	go func(ctx context.Context) {
+		defer s.buildLock.RUnlock()
 		defer s.wg.Done()
 		defer s.activeBuilds.Add(-1)
 

@@ -34,6 +34,9 @@ func (f fakeTemplateManagerClient) GetStatus(context.Context, uuid.UUID, string,
 	return f.getStatusResponse, f.getStatusErr
 }
 
+func (f fakeTemplateManagerClient) collectStorageAfterBuild(context.Context, uuid.UUID, uuid.UUID, string) {
+}
+
 func TestPollBuildStatus_setStatus(t *testing.T) {
 	t.Parallel()
 	type fields struct {

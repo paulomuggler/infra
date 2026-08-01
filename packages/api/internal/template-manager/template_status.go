@@ -86,6 +86,7 @@ type templateManagerClient interface {
 	SetStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) error
 	SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion string) error
 	GetStatus(ctx context.Context, buildId uuid.UUID, templateID string, clusterID uuid.UUID, nodeID string) (*templatemanagergrpc.TemplateBuildStatusResponse, error)
+	collectStorageAfterBuild(ctx context.Context, buildID uuid.UUID, clusterID uuid.UUID, nodeID string)
 }
 
 type PollBuildStatus struct {
@@ -204,6 +205,13 @@ func (c *PollBuildStatus) dispatchBasedOnStatus(ctx context.Context, status *tem
 		if err != nil {
 			return false, errors.Wrap(err, "error when finishing build")
 		}
+
+		// The supersede event. This build has just become what its template
+		// resolves to, which is the moment its predecessor's exclusive layers
+		// stop being reachable from any root. Collect them now rather than
+		// waiting for the sweep — at 75-165 GiB of build output a day, the
+		// backlog between sweeps is the whole problem.
+		go c.client.collectStorageAfterBuild(ctx, c.buildID, c.clusterID, c.nodeID)
 
 		return true, nil
 	default:

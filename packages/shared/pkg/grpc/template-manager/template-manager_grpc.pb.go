@@ -20,10 +20,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	TemplateService_TemplateCreate_FullMethodName      = "/TemplateService/TemplateCreate"
-	TemplateService_TemplateBuildStatus_FullMethodName = "/TemplateService/TemplateBuildStatus"
-	TemplateService_TemplateBuildDelete_FullMethodName = "/TemplateService/TemplateBuildDelete"
-	TemplateService_InitLayerFileUpload_FullMethodName = "/TemplateService/InitLayerFileUpload"
+	TemplateService_TemplateCreate_FullMethodName         = "/TemplateService/TemplateCreate"
+	TemplateService_TemplateBuildStatus_FullMethodName    = "/TemplateService/TemplateBuildStatus"
+	TemplateService_TemplateBuildDelete_FullMethodName    = "/TemplateService/TemplateBuildDelete"
+	TemplateService_TemplateStorageCollect_FullMethodName = "/TemplateService/TemplateStorageCollect"
+	TemplateService_InitLayerFileUpload_FullMethodName    = "/TemplateService/InitLayerFileUpload"
 )
 
 // TemplateServiceClient is the client API for TemplateService service.
@@ -38,6 +39,9 @@ type TemplateServiceClient interface {
 	TemplateBuildStatus(ctx context.Context, in *TemplateStatusRequest, opts ...grpc.CallOption) (*TemplateBuildStatusResponse, error)
 	// TemplateBuildDelete is a gRPC service that deletes files associated with a template build
 	TemplateBuildDelete(ctx context.Context, in *TemplateBuildDeleteRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// TemplateStorageCollect reclaims template-storage build directories that are
+	// no longer reachable from any live root.
+	TemplateStorageCollect(ctx context.Context, in *TemplateStorageCollectRequest, opts ...grpc.CallOption) (*TemplateStorageCollectResponse, error)
 	// InitLayerFileUpload requests an upload URL for a tar file containing layer files to be cached for the template build.
 	InitLayerFileUpload(ctx context.Context, in *InitLayerFileUploadRequest, opts ...grpc.CallOption) (*InitLayerFileUploadResponse, error)
 }
@@ -80,6 +84,16 @@ func (c *templateServiceClient) TemplateBuildDelete(ctx context.Context, in *Tem
 	return out, nil
 }
 
+func (c *templateServiceClient) TemplateStorageCollect(ctx context.Context, in *TemplateStorageCollectRequest, opts ...grpc.CallOption) (*TemplateStorageCollectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TemplateStorageCollectResponse)
+	err := c.cc.Invoke(ctx, TemplateService_TemplateStorageCollect_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *templateServiceClient) InitLayerFileUpload(ctx context.Context, in *InitLayerFileUploadRequest, opts ...grpc.CallOption) (*InitLayerFileUploadResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(InitLayerFileUploadResponse)
@@ -102,6 +116,9 @@ type TemplateServiceServer interface {
 	TemplateBuildStatus(context.Context, *TemplateStatusRequest) (*TemplateBuildStatusResponse, error)
 	// TemplateBuildDelete is a gRPC service that deletes files associated with a template build
 	TemplateBuildDelete(context.Context, *TemplateBuildDeleteRequest) (*emptypb.Empty, error)
+	// TemplateStorageCollect reclaims template-storage build directories that are
+	// no longer reachable from any live root.
+	TemplateStorageCollect(context.Context, *TemplateStorageCollectRequest) (*TemplateStorageCollectResponse, error)
 	// InitLayerFileUpload requests an upload URL for a tar file containing layer files to be cached for the template build.
 	InitLayerFileUpload(context.Context, *InitLayerFileUploadRequest) (*InitLayerFileUploadResponse, error)
 	mustEmbedUnimplementedTemplateServiceServer()
@@ -122,6 +139,9 @@ func (UnimplementedTemplateServiceServer) TemplateBuildStatus(context.Context, *
 }
 func (UnimplementedTemplateServiceServer) TemplateBuildDelete(context.Context, *TemplateBuildDeleteRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method TemplateBuildDelete not implemented")
+}
+func (UnimplementedTemplateServiceServer) TemplateStorageCollect(context.Context, *TemplateStorageCollectRequest) (*TemplateStorageCollectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TemplateStorageCollect not implemented")
 }
 func (UnimplementedTemplateServiceServer) InitLayerFileUpload(context.Context, *InitLayerFileUploadRequest) (*InitLayerFileUploadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InitLayerFileUpload not implemented")
@@ -201,6 +221,24 @@ func _TemplateService_TemplateBuildDelete_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TemplateService_TemplateStorageCollect_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TemplateStorageCollectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TemplateServiceServer).TemplateStorageCollect(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TemplateService_TemplateStorageCollect_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TemplateServiceServer).TemplateStorageCollect(ctx, req.(*TemplateStorageCollectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _TemplateService_InitLayerFileUpload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(InitLayerFileUploadRequest)
 	if err := dec(in); err != nil {
@@ -237,6 +275,10 @@ var TemplateService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TemplateBuildDelete",
 			Handler:    _TemplateService_TemplateBuildDelete_Handler,
+		},
+		{
+			MethodName: "TemplateStorageCollect",
+			Handler:    _TemplateService_TemplateStorageCollect_Handler,
 		},
 		{
 			MethodName: "InitLayerFileUpload",

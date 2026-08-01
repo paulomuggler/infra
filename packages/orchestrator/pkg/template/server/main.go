@@ -43,6 +43,18 @@ type ServerStore struct {
 	templateStorage   storage.StorageProvider
 	buildStorage      storage.StorageProvider
 
+	// sandboxes and templateCache are the orchestrator's own view of what is
+	// live right now. Storage GC unions them onto the registry roots its caller
+	// supplies, so a running sandbox's layers are safe from collection whether
+	// or not the caller knew about them.
+	sandboxes     *sandbox.Map
+	templateCache *sbxtemplate.Cache
+
+	// buildLock serialises storage GC against builds. Builds hold it for read
+	// for their whole duration; a GC pass holds it for write. Nothing that
+	// writes template storage overlaps a pass that deletes from it.
+	buildLock sync.RWMutex
+
 	wg           *sync.WaitGroup // wait group for running builds
 	activeBuilds atomic.Int64    // counter for active builds (for debugging)
 
@@ -118,6 +130,8 @@ func New(
 		artifactsregistry: artifactsRegistry,
 		templateStorage:   templatePersistence,
 		buildStorage:      buildPersistence,
+		sandboxes:         sandboxFactory.Sandboxes,
+		templateCache:     templateCache,
 		wg:                &sync.WaitGroup{},
 		closers:           closers,
 	}

@@ -67,6 +67,23 @@ func (m *Map) Items() map[string]*Sandbox {
 	return result
 }
 
+// BuildIDs returns the build ID of every sandbox in the map, whatever its
+// status. Unlike Items it does not filter to running: a starting sandbox is
+// already mapping its template's layers and a stopping one has not finished
+// unmapping them, so storage GC has to treat all three as live.
+func (m *Map) BuildIDs() []string {
+	all := m.sandboxes.Items()
+	out := make([]string, 0, len(all))
+
+	for _, sbx := range all {
+		if sbx.Runtime.BuildID != "" {
+			out = append(out, sbx.Runtime.BuildID)
+		}
+	}
+
+	return out
+}
+
 func (m *Map) Count() int {
 	count := 0
 	for _, v := range m.sandboxes.Items() {

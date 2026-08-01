@@ -166,3 +166,27 @@ func (c *BuildCache) Create(teamID string, buildID string, logs *buildlogger.Log
 func (c *BuildCache) Delete(buildID string) {
 	c.cache.Delete(buildID)
 }
+
+// RunningBuildIDs returns the IDs of builds this node still reports as
+// building. Storage GC treats them as roots: an in-flight build's directories
+// are not yet referenced by anything the registry knows about, so nothing else
+// would hold them alive. Reads the cache without touching TTLs.
+func (c *BuildCache) RunningBuildIDs() []string {
+	items := c.cache.Items()
+	out := make([]string, 0, len(items))
+
+	for buildID, item := range items {
+		if item == nil {
+			continue
+		}
+
+		info := item.Value()
+		if info == nil || !info.IsRunning() {
+			continue
+		}
+
+		out = append(out, buildID)
+	}
+
+	return out
+}

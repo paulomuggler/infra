@@ -36,6 +36,10 @@ func (m *mockTemplateServiceClient) TemplateBuildDelete(_ context.Context, _ *te
 	return &emptypb.Empty{}, nil
 }
 
+func (m *mockTemplateServiceClient) TemplateStorageCollect(_ context.Context, _ *templatemanagergrpc.TemplateStorageCollectRequest, _ ...grpc.CallOption) (*templatemanagergrpc.TemplateStorageCollectResponse, error) {
+	return &templatemanagergrpc.TemplateStorageCollectResponse{}, nil
+}
+
 func (m *mockTemplateServiceClient) InitLayerFileUpload(_ context.Context, _ *templatemanagergrpc.InitLayerFileUploadRequest, _ ...grpc.CallOption) (*templatemanagergrpc.InitLayerFileUploadResponse, error) {
 	return &templatemanagergrpc.InitLayerFileUploadResponse{}, nil
 }

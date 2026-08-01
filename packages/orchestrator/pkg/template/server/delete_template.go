@@ -24,6 +24,11 @@ func (s *ServerStore) TemplateBuildDelete(ctx context.Context, in *templatemanag
 	))
 	defer childSpan.End()
 
+	// Same lock a build takes: an explicit build delete and a GC pass both
+	// mutate template storage, so they must not interleave.
+	s.buildLock.RLock()
+	defer s.buildLock.RUnlock()
+
 	s.wg.Add(1)
 	defer s.wg.Done()
 
