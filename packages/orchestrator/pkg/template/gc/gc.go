@@ -112,9 +112,12 @@ type Result struct {
 	// deliberate repair sweep consumes.
 	BrokenRoots []string `json:"brokenRoots"`
 
-	Collected        []CollectedDir `json:"collected"`
-	FreedBytes       uint64         `json:"freedBytes"`
-	PrunedIndexBlobs int            `json:"prunedIndexBlobs"`
+	Collected []CollectedDir `json:"collected"`
+	// FreedBytes is apparent size — the sum of stat sizes — which reads about
+	// 1.8% above what df gives back, because rootfs.ext4 is sparse. It is what
+	// the store charges you for on paper, not what the filesystem returns.
+	FreedBytes       uint64 `json:"freedBytes"`
+	PrunedIndexBlobs int    `json:"prunedIndexBlobs"`
 
 	LedgerPath string `json:"-"`
 }
@@ -517,7 +520,13 @@ func pruneIndex(buildCacheDir string, store map[string]*dirInfo, collect map[str
 		return 0, fmt.Errorf("failed to read build cache dir %q: %w", buildCacheDir, err)
 	}
 
-	broken := brokenDirs(store)
+	// Brokenness is evaluated against the store as it will be *after* this pass,
+	// not as it is now: a directory the age floor spared may reference one that
+	// is about to go, and would be broken the moment the pass commits. Judging
+	// it on the pre-collection view leaves its index entry in place — a cache
+	// hit onto a chain that faults, which is the exact state this prune exists
+	// to prevent.
+	broken := brokenDirs(store, collect)
 	pruned := 0
 
 	for _, scope := range scopes {
@@ -593,8 +602,22 @@ func indexTarget(path string) (string, error) {
 }
 
 // brokenDirs returns every directory whose own transitive closure contains a
-// dangling reference.
-func brokenDirs(store map[string]*dirInfo) map[string]struct{} {
+// dangling reference, evaluated against the store as it will be once the
+// directories in collect are gone. Callers judging the store after a pass want
+// that view; passing a nil collect gives the present one.
+func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[string]struct{} {
+	// present reports whether a referenced directory will still be there when
+	// the pass has committed.
+	present := func(id string) bool {
+		if _, ok := store[id]; !ok {
+			return false
+		}
+
+		_, collected := collect[id]
+
+		return !collected
+	}
+
 	const (
 		unknown = iota
 		visiting
@@ -621,7 +644,7 @@ func brokenDirs(store map[string]*dirInfo) map[string]struct{} {
 		result := false
 
 		for ref := range store[id].refs {
-			if _, ok := store[ref]; !ok {
+			if !present(ref) {
 				result = true
 
 				break

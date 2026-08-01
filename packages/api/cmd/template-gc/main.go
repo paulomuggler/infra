@@ -37,6 +37,21 @@ const defaultTimeout = 30 * time.Minute
 // entirely, which is how a proof run collects something minted minutes ago.
 const unsetMinAge = -1 * time.Second
 
+// safeMinAge is the smallest age floor that still closes the pause window on
+// its own. Pausing a sandbox writes its snapshot directory outside the build
+// lock, so for the interleaving "roots are read -> a pause commits and writes
+// its directory -> the pass scans", the age floor is the ONLY thing protecting
+// that directory: the snapshot build was not in the root set the pass is
+// holding, and the sandbox's own map entry names the build it booted from, not
+// the snapshot. That window is the root read plus one snapshot write —
+// measured at one to two seconds on this host — so a minute is a ~30x margin.
+// Below it the operator has to say so.
+const safeMinAge = time.Minute
+
+// acknowledgeFlag is named in the refusal so the operator reading it knows
+// exactly what to add and, from the message above it, what they are taking on.
+const acknowledgeFlag = "unsafe-no-age-floor"
+
 func minAgeOverride(d time.Duration) *uint64 {
 	if d < 0 {
 		return nil
@@ -47,6 +62,29 @@ func minAgeOverride(d time.Duration) *uint64 {
 	return &seconds
 }
 
+// checkMinAge refuses an age floor low enough to expose a concurrently pausing
+// sandbox unless the operator has said they mean it.
+//
+// This is not an "are you sure" prompt. Deleting a paused sandbox's snapshot
+// fails silently — the sandbox resumes into Input/output error on whatever page
+// it happens to touch — and that is the failure class this whole collector
+// exists to end. The author of this tool used --min-age=0 during its own proof
+// runs without realising the exposure, which is the plainest evidence that
+// documenting it is not enough.
+func checkMinAge(minAge time.Duration, acknowledged bool) error {
+	if minAge < 0 || minAge >= safeMinAge || acknowledged {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"--min-age=%s is below %s, which leaves a sandbox that is pausing right now "+
+			"unprotected: its snapshot directory is written outside the build lock and is "+
+			"not in the root set this pass is holding, so only the age floor keeps it. "+
+			"Deleting it is silent — the sandbox resumes into I/O errors. "+
+			"Pass --%s if that is what you mean.",
+		minAge, safeMinAge, acknowledgeFlag)
+}
+
 func main() {
 	dryRun := flag.Bool("dry-run", false, "report what would be collected without deleting anything")
 	builder := flag.String("builder", env.GetEnv("TEMPLATE_GC_BUILDER_ADDR", "localhost:5008"),
@@ -55,7 +93,14 @@ func main() {
 	timeout := flag.Duration("timeout", defaultTimeout, "overall deadline for the pass")
 	minAge := flag.Duration("min-age", unsetMinAge,
 		"protect directories modified more recently than this; unset uses the builder's TEMPLATE_GC_MIN_AGE")
+	acknowledged := flag.Bool(acknowledgeFlag, false,
+		"permit a --min-age below "+safeMinAge.String()+", which exposes a concurrently pausing sandbox")
 	flag.Parse()
+
+	if err := checkMinAge(*minAge, *acknowledged); err != nil {
+		fmt.Fprintf(os.Stderr, "template-gc: %s\n", err)
+		os.Exit(2)
+	}
 
 	if err := run(*builder, *reason, *dryRun, *timeout, *minAge); err != nil {
 		fmt.Fprintf(os.Stderr, "template-gc: %s\n", err)

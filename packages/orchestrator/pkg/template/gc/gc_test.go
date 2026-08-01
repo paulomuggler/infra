@@ -494,7 +494,85 @@ func TestClosureTerminatesOnAReferenceCycle(t *testing.T) {
 	keep, dangling := closure(scanned, []string{a})
 	assert.Len(t, keep, 2)
 	assert.Empty(t, dangling)
-	assert.Len(t, brokenDirs(scanned), 0)
+	assert.Len(t, brokenDirs(scanned, nil), 0)
+}
+
+// A directory the age floor spares may reference one this pass is taking, which
+// makes it broken the moment the pass commits. Its index entry has to go with
+// it: leaving it is a cache hit onto a chain that faults, the exact state the
+// prune exists to prevent.
+func TestCollectPrunesTheIndexOfADirThisPassIsAboutToBreak(t *testing.T) {
+	store := t.TempDir()
+	cacheDir := t.TempDir()
+
+	id := ids(3)
+	root, doomedLayer, sparedByAge := id[0], id[1], id[2]
+
+	buildDir(t, store, root)
+	layerDir(t, store, doomedLayer)
+	// References the layer that is about to be collected, but is too new to be
+	// collected itself.
+	buildDir(t, store, sparedByAge, doomedLayer)
+
+	age(t, store, root, 2*time.Hour)
+	age(t, store, doomedLayer, 2*time.Hour)
+
+	indexDir := filepath.Join(cacheDir, "scope-1", "index")
+	require.NoError(t, os.MkdirAll(indexDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(indexDir, "spared"),
+		[]byte(`{"template":{"build_id":"`+sparedByAge+`"}}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(indexDir, "root"),
+		[]byte(`{"template":{"build_id":"`+root+`"}}`), 0o644))
+
+	cfg := cfgFor(store)
+	cfg.BuildCacheDir = cacheDir
+
+	res, err := Collect(t.Context(), cfg, []string{root})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, res.CollectedDirs())
+	require.Equal(t, 1, res.SkippedRecentDirs)
+
+	assert.True(t, exists(t, filepath.Join(store, sparedByAge)), "the age floor keeps the dir")
+	assert.False(t, exists(t, filepath.Join(indexDir, "spared")),
+		"but its index entry now resolves to a chain that faults, so it must be pruned")
+	assert.True(t, exists(t, filepath.Join(indexDir, "root")))
+	assert.Equal(t, 1, res.PrunedIndexBlobs)
+}
+
+// The index is pruned BEFORE the directories move, so a run that dies between
+// the two leaves "entry gone, directory present" — a cache miss — and never
+// "entry live, directory gone", which is a cache hit onto nothing.
+//
+// Pinned by making the prune fail and checking nothing has been staged. Reverse
+// the two steps in Collect and this goes red.
+func TestCollectPrunesTheIndexBeforeItMovesAnything(t *testing.T) {
+	store := t.TempDir()
+	cacheDir := t.TempDir()
+
+	id := ids(2)
+	root, orphan := id[0], id[1]
+
+	buildDir(t, store, root)
+	buildDir(t, store, orphan)
+	age(t, store, root, 2*time.Hour)
+	age(t, store, orphan, 2*time.Hour)
+
+	// A scope whose "index" is a regular file: ReadDir fails with ENOTDIR,
+	// which no amount of privilege turns into success.
+	require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "scope-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "scope-1", "index"), []byte("x"), 0o644))
+
+	cfg := cfgFor(store)
+	cfg.BuildCacheDir = cacheDir
+
+	_, err := Collect(t.Context(), cfg, []string{root})
+	require.Error(t, err)
+
+	assert.True(t, exists(t, filepath.Join(store, orphan)),
+		"a prune that fails must abort before any directory is staged")
+	assert.False(t, exists(t, filepath.Join(store, trashDirName)))
+	assert.True(t, exists(t, filepath.Join(store, root)))
 }
 
 func TestPruneIndexRemovesEntriesThatCannotResolveToAUsableLayer(t *testing.T) {
