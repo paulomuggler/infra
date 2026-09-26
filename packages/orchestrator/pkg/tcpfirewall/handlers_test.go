@@ -426,6 +426,10 @@ func TestAlwaysDeniedCIDRs(t *testing.T) {
 		{"172.31.255.255 is denied", "172.31.255.255", true},
 		{"169.254.1.1 is denied (link-local)", "169.254.1.1", true},
 		{"127.0.0.1 is denied (loopback)", "127.0.0.1", true},
+		{"100.64.0.1 is denied (shared address space)", "100.64.0.1", true},
+		{"100.100.100.100 is denied (Tailscale MagicDNS)", "100.100.100.100", true},
+		{"100.127.255.255 is denied (shared address space)", "100.127.255.255", true},
+		{"100.128.0.1 is allowed (outside shared address space)", "100.128.0.1", false},
 
 		// IPs NOT in denied CIDRs (public IPs)
 		{"8.8.8.8 is allowed (Google DNS)", "8.8.8.8", false},
@@ -436,6 +440,7 @@ func TestAlwaysDeniedCIDRs(t *testing.T) {
 		{"::1 is denied (IPv6 loopback)", "::1", true},
 		{"fc00::1 is denied (IPv6 unique local)", "fc00::1", true},
 		{"fe80::1 is denied (IPv6 link-local)", "fe80::1", true},
+		{"fd7a:115c:a1e0::1 is denied (Tailscale IPv6)", "fd7a:115c:a1e0::1", true},
 
 		// IPv6 allowed (public)
 		{"2001:4860:4860::8888 is allowed (Google IPv6 DNS)", "2001:4860:4860::8888", false},

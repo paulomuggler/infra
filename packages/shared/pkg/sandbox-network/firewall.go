@@ -22,6 +22,12 @@ var DeniedSandboxCIDRs = []string{
 	"169.254.0.0/16",
 	"172.16.0.0/12",
 	"192.168.0.0/16",
+	// Shared address space (RFC 6598), which Tailscale (and CGNAT) uses: the tailnet addresses
+	// and MagicDNS at 100.100.100.100. The egress proxy dials an allowed domain from the host,
+	// whose resolver knows tailnet names, so without this an allowed domain that resolves to
+	// a tailnet address reaches whatever the host's tailnet identity may. The tailnet's IPv6
+	// range (fd7a:115c:a1e0::/48) is inside fc00::/7 below.
+	"100.64.0.0/10",
 	// IPv6 local ranges
 	"::1/128",
 	"fc00::/7",
