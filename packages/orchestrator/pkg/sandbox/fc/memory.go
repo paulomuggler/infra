@@ -55,3 +55,33 @@ func (p *Process) ExportMemory(
 
 	return cache, nil
 }
+
+// ExportMemoryWithBase writes every block in include to a new cache at
+// cachePath, packed in block order. Blocks in dirty are copied out of the FC
+// process memory; the others are read from base, the memfile the sandbox was
+// resumed from, which still holds them because the guest never wrote them.
+func (p *Process) ExportMemoryWithBase(
+	ctx context.Context,
+	include *roaring.Bitmap,
+	dirty *roaring.Bitmap,
+	base block.Slicer,
+	cachePath string,
+	blockSize int64,
+) (*block.Cache, error) {
+	m, err := p.client.memoryMapping(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get memory mappings: %w", err)
+	}
+
+	pid, err := p.Pid()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pid: %w", err)
+	}
+
+	cache, err := block.NewCacheFromProcessMemoryAndBase(ctx, blockSize, cachePath, pid, include, dirty, m.GetHostVirtRanges, base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cache: %w", err)
+	}
+
+	return cache, nil
+}

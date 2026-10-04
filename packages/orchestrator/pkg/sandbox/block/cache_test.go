@@ -2,6 +2,7 @@ package block
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -726,7 +728,7 @@ func BenchmarkCopyFromHugepagesFile(b *testing.B) {
 			break
 		}
 
-		err = cache.copyProcessMemory(b.Context(), pid, ranges)
+		err = cache.copyProcessMemory(b.Context(), pid, ranges, 0)
 		require.NoError(b, err)
 
 		b.StopTimer()
@@ -738,5 +740,194 @@ func BenchmarkCopyFromHugepagesFile(b *testing.B) {
 		require.NoError(b, err)
 
 		b.SetBytes(GetSize(ranges))
+	}
+}
+
+// sliceBase is a Slicer over an in-memory image, standing in for the memfile
+// a sandbox was resumed from.
+type sliceBase struct {
+	data      []byte
+	blockSize int64
+	reads     []int64
+}
+
+func (s *sliceBase) Slice(_ context.Context, off, length int64) ([]byte, error) {
+	s.reads = append(s.reads, off)
+
+	return s.data[off : off+length], nil
+}
+
+func (s *sliceBase) BlockSize() int64 { return s.blockSize }
+
+// The self-contained memfile layout: every included block, packed in block
+// order, dirty ones from process memory and the rest from the base.
+func TestNewCacheFromProcessMemoryAndBase_PacksProcessAndBaseBlocks(t *testing.T) {
+	t.Parallel()
+
+	blockSize := int64(header.PageSize)
+	blocks := int64(10)
+
+	addr, mem := allocateTestMemory(t, uint64(blocks*blockSize), uint64(blockSize))
+
+	baseData := make([]byte, blocks*blockSize)
+	_, err := rand.Read(baseData)
+	require.NoError(t, err)
+
+	base := &sliceBase{data: baseData, blockSize: blockSize}
+
+	include := roaring.BitmapOf(0, 1, 3, 4, 5, 7, 8)
+	// 9 is dirty but not included (the caller decided it is empty): it must
+	// not be copied anywhere.
+	fromProcess := roaring.BitmapOf(1, 4, 5, 8, 9)
+
+	hostRanges := func(off, size int64) ([]Range, error) {
+		return []Range{{Start: int64(addr) + off, Size: size}}, nil
+	}
+
+	cache, err := NewCacheFromProcessMemoryAndBase(
+		t.Context(),
+		blockSize,
+		t.TempDir()+"/cache",
+		os.Getpid(),
+		include,
+		fromProcess,
+		hostRanges,
+		base,
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { cache.Close() })
+
+	size, err := cache.Size()
+	require.NoError(t, err)
+	require.Equal(t, int64(include.GetCardinality())*blockSize, size)
+
+	for i, idx := range include.ToArray() {
+		src := baseData
+		if fromProcess.Contains(idx) {
+			src = mem
+		}
+
+		want := src[int64(idx)*blockSize : int64(idx+1)*blockSize]
+
+		got, err := cache.Slice(int64(i)*blockSize, blockSize)
+		require.NoError(t, err, "block %d (cache position %d) is not marked cached", idx, i)
+		require.Equal(t, want, got, "block %d (cache position %d)", idx, i)
+	}
+
+	// Only the clean blocks are read from the base.
+	require.Equal(t, []int64{0, 3 * blockSize, 7 * blockSize}, base.reads)
+}
+
+// A block that is neither in process memory nor readable from a base cannot be
+// written, and saying so beats writing zeros.
+func TestNewCacheFromProcessMemoryAndBase_NoBaseForCleanBlock(t *testing.T) {
+	t.Parallel()
+
+	blockSize := int64(header.PageSize)
+
+	addr, _ := allocateTestMemory(t, uint64(4*blockSize), uint64(blockSize))
+
+	path := t.TempDir() + "/cache"
+
+	_, err := NewCacheFromProcessMemoryAndBase(
+		t.Context(),
+		blockSize,
+		path,
+		os.Getpid(),
+		roaring.BitmapOf(0, 1),
+		roaring.BitmapOf(0),
+		func(off, size int64) ([]Range, error) {
+			return []Range{{Start: int64(addr) + off, Size: size}}, nil
+		},
+		nil,
+	)
+	require.ErrorContains(t, err, "no base to read them from")
+
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist, "a failed build must not leave its cache file behind")
+}
+
+// fileBase is a Slicer over a file, read through the page cache the way a
+// local template-storage memfile is.
+type fileBase struct {
+	f         *os.File
+	blockSize int64
+	buf       []byte
+}
+
+func (s *fileBase) Slice(_ context.Context, off, length int64) ([]byte, error) {
+	if int64(len(s.buf)) < length {
+		s.buf = make([]byte, length)
+	}
+
+	n, err := s.f.ReadAt(s.buf[:length], off)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.buf[:n], nil
+}
+
+func (s *fileBase) BlockSize() int64 { return s.blockSize }
+
+// BenchmarkNewCacheFromProcessMemoryAndBase compares the two sources of a
+// self-contained memfile per byte: blocks copied out of process memory (what
+// every pause already does for dirty blocks) and blocks read from a cold base
+// file (what a self-contained pause adds for clean ones). Run it with TMPDIR
+// on the disk the orchestrator caches on; tmpfs measures nothing.
+func BenchmarkNewCacheFromProcessMemoryAndBase(b *testing.B) {
+	blockSize := int64(header.HugepageSize)
+	blocks := int64(512) // 1 GiB
+	size := blocks * blockSize
+
+	mem, err := syscall.Mmap(-1, 0, int(size), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANONYMOUS)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = syscall.Munmap(mem) })
+
+	_, err = rand.Read(mem)
+	require.NoError(b, err)
+
+	addr := int64(uintptr(unsafe.Pointer(&mem[0])))
+
+	basePath := b.TempDir() + "/base"
+	require.NoError(b, os.WriteFile(basePath, mem, 0o600))
+
+	f, err := os.Open(basePath)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = f.Close() })
+
+	all := roaring.New()
+	all.AddRange(0, uint64(blocks))
+
+	for _, tc := range []struct {
+		name        string
+		fromProcess *roaring.Bitmap
+	}{
+		{"process", all},
+		{"cold-base", roaring.New()},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(size)
+
+			for b.Loop() {
+				b.StopTimer()
+				require.NoError(b, f.Sync())
+				require.NoError(b, unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED))
+				path := b.TempDir() + "/cache"
+				b.StartTimer()
+
+				cache, err := NewCacheFromProcessMemoryAndBase(b.Context(), blockSize, path, os.Getpid(), all, tc.fromProcess,
+					func(off, size int64) ([]Range, error) {
+						return []Range{{Start: addr + off, Size: size}}, nil
+					},
+					&fileBase{f: f, blockSize: blockSize})
+				require.NoError(b, err)
+
+				b.StopTimer()
+				require.NoError(b, cache.Close())
+				b.StartTimer()
+			}
+		})
 	}
 }

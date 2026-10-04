@@ -268,9 +268,13 @@ func (lb *LayerExecutor) PauseAndUpload(
 	persistedMeta.MemfileOmitted = !persistMemfile
 
 	// snapshot is automatically cleared by the templateCache eviction
+	// A layer stays a diff: under the leaf-only policy only the final layer's
+	// memfile is kept, and that one is taken from a cold-booted VM, which has
+	// no earlier memfile to reference.
 	snapshot, err := sbx.Pause(
 		ctx,
 		persistedMeta,
+		sandbox.MemfileDiff,
 	)
 	if err != nil {
 		return fmt.Errorf("error processing vm: %w", err)

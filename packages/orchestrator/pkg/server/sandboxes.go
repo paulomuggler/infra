@@ -745,7 +745,9 @@ func (s *Server) snapshotAndCacheSandbox(
 		FirecrackerVersion: sbx.Config.FirecrackerConfig.FirecrackerVersion,
 	})
 
-	snapshot, err := sbx.Pause(ctx, meta)
+	// A sandbox snapshot is written whole, so it needs no earlier snapshot's
+	// memfile and storage GC can drop those once a newer one exists.
+	snapshot, err := sbx.Pause(ctx, meta, sandbox.MemfileSelfContained)
 	if err != nil {
 		return nil, fmt.Errorf("error snapshotting sandbox: %w", err)
 	}

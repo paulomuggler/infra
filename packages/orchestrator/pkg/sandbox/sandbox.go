@@ -1040,10 +1040,12 @@ func (s *Sandbox) Shutdown(ctx context.Context) error {
 //  4. In case of NoopMemory (the sandbox was not a resume) we also call the custom FC endpoint,
 //     that returns info about resident memory pages and about empty memory pages.
 //  5. Base on the info from the custom FC endpoint or from Uffd we copy the pages directly from the FC process to a local cache.
+//     With MemfileSelfContained the blocks the guest left clean are copied too, from the memfile the sandbox was resumed from.
 //  6. We then can either close the sandbox or resume it.
 func (s *Sandbox) Pause(
 	ctx context.Context,
 	m metadata.Template,
+	memfileLayout MemfileLayout,
 ) (st *Snapshot, e error) {
 	ctx, span := tracer.Start(ctx, "sandbox-snapshot")
 	defer span.End()
@@ -1104,8 +1106,9 @@ func (s *Sandbox) Pause(
 	memfileDiff, memfileDiffHeader, err := pauseProcessMemory(
 		ctx,
 		buildID,
-		originalMemfile.Header(),
+		originalMemfile,
 		memfileDiffMetadata,
+		memfileLayout,
 		s.config.DefaultCacheDir,
 		s.process,
 	)
@@ -1159,32 +1162,90 @@ func (s *Sandbox) MemoryPrefetchData(ctx context.Context) (block.PrefetchData, e
 	return prefetchData, nil
 }
 
+// MemfileLayout says what a pause writes for the guest's memory.
+type MemfileLayout int
+
+const (
+	// MemfileDiff writes only the blocks the guest dirtied. The header maps
+	// every other block to the memfile the sandbox was resumed from, and
+	// through it to every build that memfile maps to.
+	MemfileDiff MemfileLayout = iota
+	// MemfileSelfContained also writes the blocks the guest left clean, read
+	// from the memfile the sandbox was resumed from, so the header maps every
+	// block to this build or to the empty sentinel and needs no earlier
+	// snapshot's memfile. A paused sandbox's newest snapshot then holds its
+	// whole RAM image, and storage GC can drop its predecessors' memfiles.
+	// With hugepages the guest dirties most blocks between a resume and the
+	// next pause anyway, so the extra copy is the remainder, not the guest.
+	MemfileSelfContained
+)
+
 func pauseProcessMemory(
 	ctx context.Context,
 	buildID uuid.UUID,
-	originalHeader *header.Header,
+	originalMemfile block.ReadonlyDevice,
 	diffMetadata *header.DiffMetadata,
+	layout MemfileLayout,
 	cacheDir string,
 	fc *fc.Process,
 ) (d build.Diff, h *header.Header, e error) {
 	ctx, span := tracer.Start(ctx, "process-memory")
 	defer span.End()
 
-	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create memfile header: %w", err)
-	}
-
+	originalHeader := originalMemfile.Header()
 	memfileDiffPath := build.GenerateDiffCachePath(cacheDir, buildID.String(), build.Memfile)
 
-	cache, err := fc.ExportMemory(
-		ctx,
-		diffMetadata.Dirty,
-		memfileDiffPath,
-		diffMetadata.BlockSize,
-	)
+	var stored *header.DiffMetadata
+	var cache *block.Cache
+
+	switch layout {
+	case MemfileDiff:
+		stored = diffMetadata
+
+		c, err := fc.ExportMemory(
+			ctx,
+			diffMetadata.Dirty,
+			memfileDiffPath,
+			diffMetadata.BlockSize,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to export memory: %w", err)
+		}
+
+		cache = c
+	case MemfileSelfContained:
+		sc, err := diffMetadata.SelfContained(originalHeader)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to widen memfile diff to the whole guest: %w", err)
+		}
+
+		stored = sc
+
+		span.SetAttributes(
+			attribute.Int64("snapshot.memfile.dirty_blocks", int64(diffMetadata.Dirty.GetCardinality())),
+			attribute.Int64("snapshot.memfile.stored_blocks", int64(sc.Dirty.GetCardinality())),
+		)
+
+		c, err := fc.ExportMemoryWithBase(
+			ctx,
+			sc.Dirty,
+			diffMetadata.Dirty,
+			originalMemfile,
+			memfileDiffPath,
+			diffMetadata.BlockSize,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to export memory: %w", err)
+		}
+
+		cache = c
+	default:
+		return nil, nil, fmt.Errorf("unknown memfile layout %d", layout)
+	}
+
+	header, err := stored.ToDiffHeader(ctx, originalHeader, buildID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to export memory: %w", err)
+		return nil, nil, fmt.Errorf("failed to create memfile header: %w", errors.Join(err, cache.Close()))
 	}
 
 	diff, err := build.NewLocalDiffFromCache(

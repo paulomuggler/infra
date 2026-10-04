@@ -428,7 +428,7 @@ func NewCacheFromProcessMemory(
 		return cache, nil
 	}
 
-	err = cache.copyProcessMemory(ctx, pid, ranges)
+	err = cache.copyProcessMemory(ctx, pid, ranges, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to copy process memory: %w", errors.Join(err, cache.Close()))
 	}
@@ -436,10 +436,138 @@ func NewCacheFromProcessMemory(
 	return cache, nil
 }
 
+// NewCacheFromProcessMemoryAndBase builds a cache holding every block in
+// include, packed in block order — the layout header.CreateMapping assigns to
+// a diff's data file. Blocks also in fromProcess are copied out of the
+// process's memory, through hostRanges (guest offset range to host virtual
+// address ranges). Every other block is read from base, the device the
+// process's memory was populated from, which is what that block still holds.
+//
+// It is how a pause writes a memfile that needs no earlier build: the guest's
+// dirty blocks come from the guest, the clean ones from the snapshot it was
+// resumed from.
+func NewCacheFromProcessMemoryAndBase(
+	ctx context.Context,
+	blockSize int64,
+	filePath string,
+	pid int,
+	include *roaring.Bitmap,
+	fromProcess *roaring.Bitmap,
+	hostRanges func(off, size int64) ([]Range, error),
+	base Slicer,
+) (c *Cache, e error) {
+	size := int64(include.GetCardinality()) * blockSize
+
+	cache, err := NewCache(size, blockSize, filePath, false)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if e != nil {
+			e = errors.Join(e, cache.Close())
+		}
+	}()
+
+	// Process blocks are batched: consecutive runs of them land contiguously
+	// in the cache, so they go to copyProcessMemory as one list of ranges and
+	// keep its IOV_MAX batching. A base run in between breaks the batch.
+	var pending []Range
+	var pendingOffset int64
+
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+
+		err := cache.copyProcessMemory(ctx, pid, pending, pendingOffset)
+		pending = nil
+
+		return err
+	}
+
+	var offset int64
+
+	for start, endExcl := range include.Ranges() {
+		for idx := uint64(start); idx < endExcl; {
+			own := fromProcess.Contains(uint32(idx))
+
+			runEnd := idx + 1
+			for runEnd < endExcl && fromProcess.Contains(uint32(runEnd)) == own {
+				runEnd++
+			}
+
+			guest := NewRangeFromBlocks(int64(idx), int64(runEnd-idx), blockSize)
+
+			if own {
+				hosts, err := hostRanges(guest.Start, guest.Size)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get host virt ranges: %w", err)
+				}
+
+				if len(pending) == 0 {
+					pendingOffset = offset
+				}
+
+				pending = append(pending, hosts...)
+			} else {
+				if err := flush(); err != nil {
+					return nil, fmt.Errorf("failed to copy process memory: %w", err)
+				}
+
+				if err := cache.copyFromBase(ctx, base, guest, offset); err != nil {
+					return nil, err
+				}
+			}
+
+			offset += guest.Size
+			idx = runEnd
+		}
+	}
+
+	if err := flush(); err != nil {
+		return nil, fmt.Errorf("failed to copy process memory: %w", err)
+	}
+
+	return cache, nil
+}
+
+// copyFromBase copies the guest range r of base into the cache at offset, one
+// block at a time — the unit base's Slice serves.
+func (c *Cache) copyFromBase(ctx context.Context, base Slicer, r Range, offset int64) error {
+	if base == nil {
+		return fmt.Errorf("blocks at offset %d (%d bytes) are not in process memory and there is no base to read them from", r.Start, r.Size)
+	}
+
+	for n := int64(0); n < r.Size; n += c.blockSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		b, err := base.Slice(ctx, r.Start+n, c.blockSize)
+		if err != nil {
+			return fmt.Errorf("failed to read base at offset %d: %w", r.Start+n, err)
+		}
+
+		if int64(len(b)) != c.blockSize {
+			return fmt.Errorf("short read from base at offset %d: %d of %d bytes", r.Start+n, len(b), c.blockSize)
+		}
+
+		if _, err := c.WriteAtWithoutLock(b, offset+n); err != nil {
+			return fmt.Errorf("failed to write cache at offset %d: %w", offset+n, err)
+		}
+	}
+
+	return nil
+}
+
+// copyProcessMemory copies the process memory ranges rs into the cache,
+// contiguously, starting at offset.
 func (c *Cache) copyProcessMemory(
 	ctx context.Context,
 	pid int,
 	rs []Range,
+	offset int64,
 ) error {
 	// We need to align the maximum read/write count to the block size, so we can use mark the offsets as dirty correctly.
 	// Because the MAX_RW_COUNT is not aligned to arbitrary block sizes, we need to align it to the block size we use for the cache.
@@ -448,7 +576,6 @@ func (c *Cache) copyProcessMemory(
 	// We need to split the ranges because the Kernel does not support reading/writing more than MAX_RW_COUNT bytes in a single operation.
 	ranges := splitOversizedRanges(rs, alignedRwCount)
 
-	var offset int64
 	var rangeIdx int64
 
 	for {
