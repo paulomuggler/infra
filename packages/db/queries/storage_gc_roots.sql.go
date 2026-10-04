@@ -48,10 +48,27 @@ FROM (
 
     UNION
 
-    -- 4. In-flight builds, which nothing else references yet.
+    -- 4. In-flight builds, which nothing else references yet. A pause build
+    -- ('snapshotting') is in flight only while its pause can still finish it:
+    -- the API bounds a pause by PauseTimeout (10 min,
+    -- api/internal/orchestrator/pause_instance.go) and marks it failed when it
+    -- does not finish, so one older than that plus a margin was abandoned (the
+    -- API restarted mid-pause). One whose env is gone, so no assignment is left
+    -- (the sandbox was killed), is dead as well.
     SELECT eb.id
     FROM public.env_builds eb
     WHERE eb.status_group IN ('pending', 'in_progress')
+      AND (
+          eb.status <> 'snapshotting'
+          OR (
+              eb.created_at > now() - interval '20 minutes'
+              AND EXISTS (
+                  SELECT 1
+                  FROM public.env_build_assignments eba
+                  WHERE eba.build_id = eb.id
+              )
+          )
+      )
 
     UNION
 
