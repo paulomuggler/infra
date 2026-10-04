@@ -1,15 +1,25 @@
 -- name: GetStorageGCRoots :many
 -- Every build the registry considers live, for template-storage GC.
 --
--- Storage GC keeps a build directory only if it is reachable, through header
--- block mappings, from one of these. Anything left out is deleted, so each
--- clause below is a safety property rather than an optimisation.
+-- Storage GC keeps a build's rootfs and memfile, each on its own, only if it is
+-- reachable, through header block mappings, from one of these. Anything left
+-- out is deleted, so each clause below is a safety property rather than an
+-- optimisation.
 SELECT DISTINCT r.build_id::uuid AS build_id
 FROM (
-    -- 1. What a spawn resolves to, for every template and every tag. This
-    -- mirrors GetTemplateWithBuildByTag exactly: newest 'ready' assignment per
-    -- (env, tag). It covers source='template', 'snapshot' (a paused sandbox's
-    -- snapshot env) and 'snapshot_template' uniformly.
+    -- 1. What a spawn or a resume resolves to, for every template and every
+    -- tag. This mirrors GetTemplateWithBuildByTag exactly: newest 'ready'
+    -- assignment per (env, tag). It covers source='template', 'snapshot' (a
+    -- paused sandbox's snapshot env) and 'snapshot_template' uniformly.
+    --
+    -- For a paused sandbox that is its newest snapshot, and only that one. A
+    -- pause writes a self-contained memfile, so the newest snapshot holds the
+    -- sandbox's whole RAM image; its rootfs header still maps blocks to every
+    -- earlier snapshot's rootfs diff, and storage GC keeps those through the
+    -- header, file by file. Rooting every earlier snapshot as well would pin a
+    -- guest-sized memfile per pause until the sandbox is killed. While a pause
+    -- is in flight, or after one failed, the newest ready snapshot is still the
+    -- previous one, so it stays rooted here.
     SELECT latest.build_id
     FROM (
         SELECT DISTINCT ON (eba.env_id, eba.tag) eba.build_id
@@ -20,27 +30,14 @@ FROM (
 
     UNION
 
-    -- 2. Every assignment of an env that backs a live paused sandbox, not just
-    -- the newest. A paused sandbox IS its RAM image: losing it loses the
-    -- sandbox, and pause suspends the TTL clock so it can sit there forever.
-    -- UpsertSnapshot mints the snapshots row and this assignment edge in one
-    -- statement, so this clause catches every live paused sandbox; killing one
-    -- deletes its snapshot env, which is what makes the orphaned build rows it
-    -- leaves behind collectable.
-    SELECT eba.build_id
-    FROM public.snapshots s
-    JOIN public.env_build_assignments eba ON eba.env_id = s.env_id
-
-    UNION
-
-    -- 3. Persistent snapshot templates.
+    -- 2. Persistent snapshot templates.
     SELECT st.build_id
     FROM public.snapshot_templates st
     WHERE st.build_id IS NOT NULL
 
     UNION
 
-    -- 4. In-flight builds, which nothing else references yet. A pause build
+    -- 3. In-flight builds, which nothing else references yet. A pause build
     -- ('snapshotting') is in flight only while its pause can still finish it:
     -- the API bounds a pause by PauseTimeout (10 min,
     -- api/internal/orchestrator/pause_instance.go) and marks it failed when it
