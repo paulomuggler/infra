@@ -113,6 +113,74 @@ func (d *DiffMetadata) ToDiffHeader(
 	return header, nil
 }
 
+// SelfContained widens d so that the header it builds over original names no
+// build but the new one.
+//
+// A diff header maps every block d leaves untouched to whatever original maps
+// it to, so a chain of pauses keeps every earlier snapshot's memfile alive for
+// as long as any of its blocks is still unwritten — and with 2 MiB hugepages a
+// handful of blocks per ancestor is enough to pin a whole guest-sized file. The
+// widened metadata takes those inherited blocks into the diff too: every block
+// original maps to a build becomes data of the new build, unless d already
+// says it is empty. Everything else is empty.
+//
+// The returned Dirty is the full data set, in the block order the memfile has
+// to be written in. Which of those blocks come from the guest and which are
+// carried over from original is the caller's to tell apart: d.Dirty minus
+// d.Empty is the guest's part, Inherited is the rest.
+func (d *DiffMetadata) SelfContained(original *Header) (*DiffMetadata, error) {
+	inherited, err := d.Inherited(original)
+	if err != nil {
+		return nil, err
+	}
+
+	data := d.Dirty.Clone()
+	data.AndNot(d.Empty)
+	data.Or(inherited)
+
+	total := uint64(TotalBlocks(int64(original.Metadata.Size), d.BlockSize))
+
+	empty := roaring.Flip(data, 0, total)
+	empty.RemoveRange(total, uint64(1)<<32)
+
+	return &DiffMetadata{
+		Dirty:     data,
+		Empty:     empty,
+		BlockSize: d.BlockSize,
+	}, nil
+}
+
+// Inherited returns the blocks a diff header built from d over original would
+// keep reading from original's builds: mapped to a build (not to the empty
+// sentinel) in original, and neither dirty nor empty in d.
+func (d *DiffMetadata) Inherited(original *Header) (*roaring.Bitmap, error) {
+	if int64(original.Metadata.BlockSize) != d.BlockSize {
+		return nil, fmt.Errorf("block size mismatch: original header has %d, diff has %d", original.Metadata.BlockSize, d.BlockSize)
+	}
+
+	inherited := roaring.New()
+
+	for _, m := range original.Mapping {
+		if m.BuildId == uuid.Nil || m.Length == 0 {
+			continue
+		}
+
+		if m.Offset%uint64(d.BlockSize) != 0 || m.Length%uint64(d.BlockSize) != 0 {
+			return nil, fmt.Errorf("mapping at offset %d (length %d) is not aligned to block size %d", m.Offset, m.Length, d.BlockSize)
+		}
+
+		inherited.AddRange(
+			uint64(BlockIdx(int64(m.Offset), d.BlockSize)),
+			uint64(BlockIdx(int64(m.Offset+m.Length), d.BlockSize)),
+		)
+	}
+
+	inherited.AndNot(d.Dirty)
+	inherited.AndNot(d.Empty)
+
+	return inherited, nil
+}
+
 type DiffMetadataBuilder struct {
 	dirty *roaring.Bitmap
 	empty *roaring.Bitmap
