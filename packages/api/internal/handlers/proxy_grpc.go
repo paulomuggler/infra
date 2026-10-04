@@ -107,6 +107,10 @@ func (s *SandboxService) getAutoResumeSnapshot(ctx context.Context, sandboxID st
 		return nil, nil, status.Error(codes.NotFound, "sandbox auto-resume disabled")
 	}
 
+	if err := snap.Resumable(); err != nil {
+		return nil, nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
 	return snap, autoResume, nil
 }
 

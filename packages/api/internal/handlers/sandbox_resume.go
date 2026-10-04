@@ -146,6 +146,13 @@ func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.Sa
 		return
 	}
 
+	if notReadyErr := lastSnapshot.Resumable(); notReadyErr != nil {
+		logger.L().Warn(ctx, "Refusing to resume sandbox from a snapshot older than its latest", zap.Error(notReadyErr), logger.WithSandboxID(sandboxID))
+		a.sendAPIStoreError(c, http.StatusGone, notReadyErr.Error())
+
+		return
+	}
+
 	sbxlogger.E(&sbxlogger.SandboxMetadata{
 		SandboxID:  sandboxID,
 		TemplateID: lastSnapshot.Snapshot.EnvID,
@@ -197,6 +204,14 @@ func (a *APIStore) buildResumeSandboxData(sandboxID string, autoPauseOverride *b
 				Code:      http.StatusInternalServerError,
 				ClientMsg: "Error when getting snapshot",
 				Err:       fmt.Errorf("error getting last snapshot for sandbox '%s': %w", sandboxID, err),
+			}
+		}
+
+		if err := lastSnapshot.Resumable(); err != nil {
+			return orchestrator.SandboxMetadata{}, &api.APIError{
+				Code:      http.StatusGone,
+				ClientMsg: err.Error(),
+				Err:       err,
 			}
 		}
 

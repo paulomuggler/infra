@@ -50,35 +50,41 @@ func TestGetLastSnapshot_ReturnsLatestAssignment(t *testing.T) {
 		"GetLastSnapshot should return the build from the latest assignment")
 }
 
-// TestGetLastSnapshot_OnlyReturnsSuccessBuilds verifies that GetLastSnapshot only
-// returns builds with status IN ('success', 'uploaded').
-func TestGetLastSnapshot_OnlyReturnsSuccessBuilds(t *testing.T) {
+// TestGetLastSnapshot_ReturnsNewestBuildWhateverItsStatus verifies that
+// GetLastSnapshot returns the newest build even when it is not ready (a failed
+// or unfinished pause), rather than falling back to an older ready build, which
+// would silently roll the sandbox back.
+func TestGetLastSnapshot_ReturnsNewestBuildWhateverItsStatus(t *testing.T) {
 	t.Parallel()
-	db := testutils.SetupDatabase(t)
-	ctx := t.Context()
 
-	// Create team and base template
-	teamID := testutils.CreateTestTeam(t, db)
-	baseTemplateID := testutils.CreateTestTemplate(t, db, teamID)
+	for _, status := range []types.BuildStatus{types.BuildStatusSnapshotting, types.BuildStatusFailed} {
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+			db := testutils.SetupDatabase(t)
+			ctx := t.Context()
 
-	sandboxID := "sandbox-" + uuid.New().String()
-	snapshotTemplateID := "snapshot-template-" + uuid.New().String()
+			teamID := testutils.CreateTestTeam(t, db)
+			baseTemplateID := testutils.CreateTestTemplate(t, db, teamID)
 
-	// Create first snapshot with success status
-	result1 := testutils.UpsertTestSnapshot(t, ctx, db, snapshotTemplateID, sandboxID, teamID, baseTemplateID)
-	successBuildID := result1.BuildID
+			sandboxID := "sandbox-" + uuid.New().String()
+			snapshotTemplateID := "snapshot-template-" + uuid.New().String()
 
-	time.Sleep(10 * time.Millisecond)
+			// An older ready snapshot...
+			testutils.UpsertTestSnapshot(t, ctx, db, snapshotTemplateID, sandboxID, teamID, baseTemplateID)
 
-	// Create second snapshot with snapshotting status (not success)
-	testutils.UpsertTestSnapshotWithStatus(t, ctx, db, snapshotTemplateID, sandboxID, teamID, baseTemplateID, types.BuildStatusSnapshotting)
+			time.Sleep(10 * time.Millisecond)
 
-	// GetLastSnapshot should return the success build, not the snapshotting one
-	snapshot, err := db.SqlcClient.GetLastSnapshot(ctx, sandboxID)
-	require.NoError(t, err)
+			// ...then a pause that did not land.
+			unready := testutils.UpsertTestSnapshotWithStatus(t, ctx, db, snapshotTemplateID, sandboxID, teamID, baseTemplateID, status)
 
-	assert.Equal(t, successBuildID, snapshot.EnvBuild.ID,
-		"GetLastSnapshot should only return builds with status IN ('success', 'uploaded')")
+			snapshot, err := db.SqlcClient.GetLastSnapshot(ctx, sandboxID)
+			require.NoError(t, err)
+
+			assert.Equal(t, unready.BuildID, snapshot.EnvBuild.ID,
+				"GetLastSnapshot should return the newest build, not fall back to an older ready one")
+			assert.Equal(t, status, snapshot.EnvBuild.Status)
+		})
+	}
 }
 
 // TestGetSnapshotsWithCursor_ReturnsLatestAssignment verifies that GetSnapshotsWithCursor

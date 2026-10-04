@@ -161,6 +161,12 @@ func (a *APIStore) GetSandboxesSandboxID(c *gin.Context, id string) {
 		return
 	}
 
+	if notReadyErr := lastSnapshot.Resumable(); notReadyErr != nil {
+		a.sendAPIStoreError(c, http.StatusGone, notReadyErr.Error())
+
+		return
+	}
+
 	memoryMB := int32(lastSnapshot.EnvBuild.RamMb)
 	cpuCount := int32(lastSnapshot.EnvBuild.Vcpu)
 

@@ -15,7 +15,6 @@ FROM "public"."snapshots" s
 JOIN LATERAL (
     SELECT eba.build_id
     FROM "public"."env_build_assignments" eba
-    JOIN "public"."env_builds" eb_inner ON eb_inner.id = eba.build_id AND eb_inner.status_group = 'ready'
     WHERE eba.env_id = s.env_id AND eba.tag = 'default'
     ORDER BY eba.created_at DESC
     LIMIT 1
@@ -38,6 +37,10 @@ type GetLastSnapshotRow struct {
 	EnvBuild EnvBuild
 }
 
+// The sandbox's newest snapshot build, whatever its status. A pause that
+// failed or never finished still stands for the sandbox's state: falling back
+// to an older ready build would silently roll the sandbox back, so callers see
+// the unready build and refuse to resume it.
 func (q *Queries) GetLastSnapshot(ctx context.Context, sandboxID string) (GetLastSnapshotRow, error) {
 	row := q.db.QueryRow(ctx, getLastSnapshot, sandboxID)
 	var i GetLastSnapshotRow

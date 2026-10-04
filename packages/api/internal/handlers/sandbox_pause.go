@@ -93,6 +93,14 @@ func pauseHandleNotRunningSandbox(ctx context.Context, cache *snapshotcache.Snap
 			}
 		}
 
+		if notReadyErr := snap.Resumable(); notReadyErr != nil {
+			return api.APIError{
+				Code:      http.StatusGone,
+				ClientMsg: notReadyErr.Error(),
+				Err:       notReadyErr,
+			}
+		}
+
 		logger.L().Warn(ctx, "Sandbox is already paused", logger.WithSandboxID(sandboxID))
 
 		return api.APIError{

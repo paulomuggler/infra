@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/cache"
 )
@@ -37,6 +38,26 @@ var errNotFoundSentinel = &SnapshotInfo{NotFound: true}
 
 var ErrSnapshotNotFound = errors.New("snapshot not found")
 
+// ErrSnapshotNotReady means the sandbox's newest snapshot build is not ready:
+// its pause failed, or never finished. The sandbox's state from that pause is
+// gone, and resuming an older snapshot would silently roll it back.
+var ErrSnapshotNotReady = errors.New("latest snapshot is not ready")
+
+// Resumable reports whether the sandbox can be resumed from this snapshot,
+// i.e. whether its newest build is ready. The error wraps ErrSnapshotNotReady
+// and is worded for the API client.
+func (s *SnapshotInfo) Resumable() error {
+	build := s.EnvBuild
+	switch build.StatusGroup {
+	case types.BuildStatusGroupReady:
+		return nil
+	case types.BuildStatusGroupFailed:
+		return fmt.Errorf("%w: the last pause of sandbox '%s' failed (snapshot build %s), so its state is lost; kill it and create a new one", ErrSnapshotNotReady, s.Snapshot.SandboxID, build.ID)
+	default:
+		return fmt.Errorf("%w: the last pause of sandbox '%s' never completed (snapshot build %s is '%s'), so its state is lost; kill it and create a new one", ErrSnapshotNotReady, s.Snapshot.SandboxID, build.ID, build.Status)
+	}
+}
+
 type SnapshotCache struct {
 	cache *cache.RedisCache[*SnapshotInfo]
 	db    *sqlcdb.Client
@@ -57,6 +78,7 @@ func NewSnapshotCache(db *sqlcdb.Client, redisClient redis.UniversalClient) *Sna
 }
 
 // Get returns the last snapshot for a sandbox, using cache with DB fallback.
+// Its build may not be ready; see Resumable.
 func (c *SnapshotCache) Get(ctx context.Context, sandboxID string) (*SnapshotInfo, error) {
 	ctx, span := tracer.Start(ctx, "get last snapshot")
 	defer span.End()
