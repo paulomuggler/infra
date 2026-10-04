@@ -15,8 +15,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
-// TemplateStorageCollect reclaims template-storage build directories that are
-// no longer reachable from any live root.
+// TemplateStorageCollect reclaims template-storage build directories, and the
+// rootfs or memfile files of kept ones, that are no longer reachable from any
+// live root.
 //
 // The caller supplies the registry's roots — it is the only side that can see
 // Postgres. This side unions its own live state on top (running sandboxes,
@@ -68,12 +69,16 @@ func (s *ServerStore) TemplateStorageCollect(
 	res, err := gc.Collect(ctx, cfg, roots)
 	if err == nil {
 		// The sandbox template cache is a cache, not an authority: it may hold
-		// an entry for a build that has just been collected, and a later hit on
-		// that entry would hand out a template whose backing files are gone.
-		// Dropping the entries here, still under the lock, means the cache can
-		// never outlive the store.
+		// an entry for a build that has just been collected, whole or one file
+		// of it, and a later hit on that entry would hand out a template whose
+		// backing files are gone. Dropping the entries here, still under the
+		// lock, means the cache can never outlive the store.
 		for _, c := range res.Collected {
 			s.templateCache.Invalidate(c.BuildID)
+		}
+
+		for _, t := range res.Trimmed {
+			s.templateCache.Invalidate(t.BuildID)
 		}
 	}
 	s.buildLock.Unlock()
@@ -102,8 +107,10 @@ func (s *ServerStore) TemplateStorageCollect(
 		zap.Int("scannedDirs", res.ScannedDirs),
 		zap.Int("keptDirs", res.KeptDirs),
 		zap.Int("collectedDirs", res.CollectedDirs()),
+		zap.Int("trimmedDirs", res.TrimmedDirs()),
 		zap.Uint64("freedBytes", res.FreedBytes),
 		zap.Int("skippedRecentDirs", res.SkippedRecentDirs),
+		zap.Int("skippedRecentFiles", res.SkippedRecentFiles),
 		zap.Int("prunedIndexBlobs", res.PrunedIndexBlobs),
 		zap.Int("danglingRefs", res.DanglingRefs),
 		zap.Int("brokenRoots", len(res.BrokenRoots)),

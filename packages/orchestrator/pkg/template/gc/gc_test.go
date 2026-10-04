@@ -209,6 +209,11 @@ func TestCollectKeepsATemplateFinalAlivePurelyForAPausedSnapshot(t *testing.T) {
 	assert.Equal(t, 0, res.CollectedDirs())
 	assert.True(t, exists(t, filepath.Join(store, supersededFinal)))
 
+	// The first pass took supersededFinal's memfile header (only its rootfs is
+	// mapped to), which moved its directory's mtime; age it again so the next
+	// pass is about reachability, not the floor.
+	age(t, store, supersededFinal, 2*time.Hour)
+
 	// Drop the paused sandbox from the root set (the sandbox was killed) and
 	// the same store collects the snapshot and the final it pinned.
 	res, err = Collect(t.Context(), cfgFor(store), []string{currentFinal})
@@ -428,7 +433,7 @@ func TestReadRefsIgnoresTheEmptyBlockSentinel(t *testing.T) {
 	// "" becomes uuid.Nil, the sentinel CreateMapping uses for empty blocks.
 	buildDir(t, store, id, "")
 
-	refs, err := readRefs(filepath.Join(store, id))
+	refs, err := readRefs(filepath.Join(store, id), rootfsArtifact)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
 }
@@ -442,7 +447,7 @@ func TestReadRefsFailsOnAnUnparseableHeader(t *testing.T) {
 		filepath.Join(store, id, storage.RootfsName+storage.HeaderSuffix),
 		[]byte("not a header"), 0o644))
 
-	_, err := readRefs(filepath.Join(store, id))
+	_, err := readRefs(filepath.Join(store, id), rootfsArtifact)
 	require.Error(t, err)
 
 	// And it takes the whole run with it rather than collecting on a partial
@@ -461,8 +466,9 @@ func TestVerifyDisjointRefusesWhenAKeptBuildReferencesACollectedOne(t *testing.T
 
 	err := verifyDisjoint(
 		t.Context(), store,
-		map[string]struct{}{kept: {}},
+		map[node]struct{}{{id: kept, artifact: rootfsArtifact}: {}},
 		map[string]struct{}{referenced: {}},
+		nil,
 	)
 	require.ErrorContains(t, err, "gc integrity check failed")
 }
@@ -474,8 +480,9 @@ func TestVerifyDisjointRefusesABuildThatIsBothKeptAndCollected(t *testing.T) {
 
 	err := verifyDisjoint(
 		t.Context(), store,
+		map[node]struct{}{{id: id, artifact: rootfsArtifact}: {}},
 		map[string]struct{}{id: {}},
-		map[string]struct{}{id: {}},
+		nil,
 	)
 	require.ErrorContains(t, err, "both kept and collected")
 }
@@ -492,9 +499,9 @@ func TestClosureTerminatesOnAReferenceCycle(t *testing.T) {
 	require.NoError(t, err)
 
 	keep, dangling := closure(scanned, []string{a})
-	assert.Len(t, keep, 2)
+	assert.Len(t, dirsOf(keep), 2)
 	assert.Empty(t, dangling)
-	assert.Len(t, brokenDirs(scanned, nil), 0)
+	assert.Empty(t, brokenDirs(scanned, nil, nil))
 }
 
 // A directory the age floor spares may reference one this pass is taking, which
@@ -604,7 +611,7 @@ func TestPruneIndexRemovesEntriesThatCannotResolveToAUsableLayer(t *testing.T) {
 	write("absent", absent)
 	require.NoError(t, os.WriteFile(filepath.Join(indexDir, "garbage"), []byte("{"), 0o644))
 
-	pruned, err := pruneIndex(cacheDir, scanned, map[string]struct{}{collected: {}}, false)
+	pruned, err := pruneIndex(cacheDir, scanned, map[string]struct{}{collected: {}}, nil, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, 4, pruned)
@@ -632,7 +639,7 @@ func TestPruneIndexHonoursDryRun(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(indexDir, "entry"),
 		[]byte(`{"template":{"build_id":"`+orphan+`"}}`), 0o644))
 
-	pruned, err := pruneIndex(cacheDir, scanned, map[string]struct{}{orphan: {}}, true)
+	pruned, err := pruneIndex(cacheDir, scanned, map[string]struct{}{orphan: {}}, nil, true)
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, pruned)
@@ -640,11 +647,11 @@ func TestPruneIndexHonoursDryRun(t *testing.T) {
 }
 
 func TestPruneIndexIsANoOpWithoutACacheDir(t *testing.T) {
-	pruned, err := pruneIndex("", nil, nil, false)
+	pruned, err := pruneIndex("", nil, nil, nil, false)
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
 
-	pruned, err = pruneIndex(filepath.Join(t.TempDir(), "missing"), nil, nil, false)
+	pruned, err = pruneIndex(filepath.Join(t.TempDir(), "missing"), nil, nil, nil, false)
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
 }
@@ -682,4 +689,309 @@ func TestCollectPrunesTheIndexAlongsideTheDirectories(t *testing.T) {
 func TestCollectRequiresATemplateStorageDir(t *testing.T) {
 	_, err := Collect(context.Background(), Config{}, []string{uuid.NewString()})
 	require.ErrorContains(t, err, "template storage dir is required")
+}
+
+// mappings builds a header mapping of one block for self, then one per ref
+// ("" is the empty-block sentinel).
+func mappings(self string, refs []string) ([]header.BuildMap, uint64) {
+	out := []header.BuildMap{{Offset: 0, Length: blockSize, BuildId: uuid.MustParse(self)}}
+
+	for i, ref := range refs {
+		refID := uuid.Nil
+		if ref != "" {
+			refID = uuid.MustParse(ref)
+		}
+
+		out = append(out, header.BuildMap{Offset: uint64((i + 1) * blockSize), Length: blockSize, BuildId: refID})
+	}
+
+	return out, uint64(len(out) * blockSize)
+}
+
+// snapshotDir writes a paused sandbox's snapshot: rootfs and memfile, each a
+// data file plus a header mapping to the given builds, and the snapfile and
+// metadata that only matter while the build is a root.
+func snapshotDir(t *testing.T, store, buildID string, rootfsRefs, memfileRefs []string) {
+	t.Helper()
+
+	dir := filepath.Join(store, buildID)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+
+	id := uuid.MustParse(buildID)
+
+	m, size := mappings(buildID, rootfsRefs)
+	writeHeader(t, filepath.Join(dir, storage.RootfsName+storage.HeaderSuffix), id, size, m)
+	m, size = mappings(buildID, memfileRefs)
+	writeHeader(t, filepath.Join(dir, storage.MemfileName+storage.HeaderSuffix), id, size, m)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, storage.RootfsName), make([]byte, 64), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, storage.MemfileName), make([]byte, 4096), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, storage.SnapfileName), make([]byte, 16), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, storage.MetadataName), []byte(`{"version":2}`), 0o644))
+}
+
+func memfilePaths(store, buildID string) []string {
+	return []string{
+		filepath.Join(store, buildID, storage.MemfileName),
+		filepath.Join(store, buildID, storage.MemfileName+storage.HeaderSuffix),
+	}
+}
+
+// A sandbox paused three times with self-contained memfiles: every rootfs diff
+// stays, because the newest rootfs header still maps blocks to each of them,
+// but only the newest memfile does. This is the bound the per-file split buys.
+func TestCollectKeepsOnlyTheNewestSelfContainedMemfileOfAChain(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(4)
+	template, first, second, newest := id[0], id[1], id[2], id[3]
+
+	buildDir(t, store, template)
+	snapshotDir(t, store, first, []string{template}, nil)
+	snapshotDir(t, store, second, []string{template, first}, nil)
+	snapshotDir(t, store, newest, []string{template, first, second}, nil)
+
+	for _, b := range id {
+		age(t, store, b, 2*time.Hour)
+	}
+
+	res, err := Collect(t.Context(), cfgFor(store), []string{template, newest})
+	require.NoError(t, err)
+
+	assert.Equal(t, 4, res.KeptDirs)
+	assert.Equal(t, 0, res.CollectedDirs())
+	require.Equal(t, 2, res.TrimmedDirs())
+
+	trimmed := map[string][]string{}
+	for _, tr := range res.Trimmed {
+		trimmed[tr.BuildID] = tr.Files
+		assert.Positive(t, tr.Bytes)
+	}
+
+	assert.ElementsMatch(t, []string{storage.MemfileName, storage.MemfileName + storage.HeaderSuffix}, trimmed[first])
+	assert.ElementsMatch(t, []string{storage.MemfileName, storage.MemfileName + storage.HeaderSuffix}, trimmed[second])
+
+	for _, b := range []string{first, second} {
+		for _, p := range memfilePaths(store, b) {
+			assert.False(t, exists(t, p), "superseded memfile %s should be gone", p)
+		}
+
+		assert.True(t, exists(t, filepath.Join(store, b, storage.RootfsName)), "a rootfs diff the newest snapshot maps to stays")
+		assert.True(t, exists(t, filepath.Join(store, b, storage.RootfsName+storage.HeaderSuffix)))
+		assert.True(t, exists(t, filepath.Join(store, trashDirName, b+"."+storage.MemfileName, storage.MemfileName)))
+	}
+
+	for _, p := range memfilePaths(store, newest) {
+		assert.True(t, exists(t, p), "the newest snapshot is a root and keeps its memfile")
+	}
+
+	require.NoError(t, PurgeTrash(store))
+	assert.False(t, exists(t, filepath.Join(store, trashDirName)))
+
+	// A second pass over the trimmed store finds nothing more to take and
+	// nothing broken.
+	again, err := Collect(t.Context(), cfgFor(store), []string{template, newest})
+	require.NoError(t, err)
+	assert.Equal(t, 0, again.CollectedDirs())
+	assert.Equal(t, 0, again.TrimmedDirs())
+	assert.Equal(t, 0, again.DanglingRefs)
+	assert.Empty(t, again.BrokenRoots)
+}
+
+// A snapshot paused before memfiles were self-contained still pages from its
+// ancestors' memfiles, and those stay for as long as it is a root. Only the
+// ancestor reached through rootfs alone loses its memfile.
+func TestCollectKeepsTheMemfilesADiffSnapshotStillReads(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(3)
+	rootfsOnly, memfileAncestor, newest := id[0], id[1], id[2]
+
+	snapshotDir(t, store, rootfsOnly, nil, nil)
+	snapshotDir(t, store, memfileAncestor, []string{rootfsOnly}, nil)
+	snapshotDir(t, store, newest, []string{rootfsOnly, memfileAncestor}, []string{memfileAncestor})
+
+	for _, b := range id {
+		age(t, store, b, 2*time.Hour)
+	}
+
+	res, err := Collect(t.Context(), cfgFor(store), []string{newest})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, res.TrimmedDirs())
+	assert.Equal(t, rootfsOnly, res.Trimmed[0].BuildID)
+
+	for _, p := range memfilePaths(store, memfileAncestor) {
+		assert.True(t, exists(t, p))
+	}
+}
+
+// Once a pause's memfile is the only one left, the snapshot it superseded is a
+// rootfs layer and nothing else; killing the sandbox then takes the whole
+// chain, directories and all.
+func TestCollectTakesATrimmedChainWholeWhenItsRootGoes(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(3)
+	template, first, newest := id[0], id[1], id[2]
+
+	buildDir(t, store, template)
+	snapshotDir(t, store, first, []string{template}, nil)
+	snapshotDir(t, store, newest, []string{template, first}, nil)
+
+	for _, b := range id {
+		age(t, store, b, 2*time.Hour)
+	}
+
+	_, err := Collect(t.Context(), cfgFor(store), []string{template, newest})
+	require.NoError(t, err)
+	require.NoError(t, PurgeTrash(store))
+
+	// The trim renamed files out of first's directory, which moves its mtime;
+	// age it again so this pass is about reachability, not the floor.
+	age(t, store, first, 2*time.Hour)
+
+	res, err := Collect(t.Context(), cfgFor(store), []string{template})
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, res.CollectedDirs())
+	assert.False(t, exists(t, filepath.Join(store, first)))
+	assert.False(t, exists(t, filepath.Join(store, newest)))
+	assert.True(t, exists(t, filepath.Join(store, template)))
+}
+
+// The age floor protects a file the same way it protects a directory.
+func TestCollectProtectsAFreshUnreachableMemfile(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(2)
+	first, newest := id[0], id[1]
+
+	snapshotDir(t, store, first, nil, nil)
+	snapshotDir(t, store, newest, []string{first}, nil)
+	age(t, store, newest, 2*time.Hour)
+
+	res, err := Collect(t.Context(), cfgFor(store), []string{newest})
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, res.TrimmedDirs())
+	assert.Equal(t, 1, res.SkippedRecentFiles)
+
+	for _, p := range memfilePaths(store, first) {
+		assert.True(t, exists(t, p))
+	}
+}
+
+// A header that maps blocks to a build whose directory is there but whose
+// data file for that artifact is not is a broken chain, the same as a missing
+// directory.
+func TestCollectReportsAReferenceToAMissingDataFileAsDangling(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(2)
+	ancestor, root := id[0], id[1]
+
+	snapshotDir(t, store, ancestor, nil, nil)
+	snapshotDir(t, store, root, nil, []string{ancestor})
+	require.NoError(t, os.Remove(filepath.Join(store, ancestor, storage.MemfileName)))
+
+	for _, b := range id {
+		age(t, store, b, 2*time.Hour)
+	}
+
+	res, err := Collect(t.Context(), cfgFor(store), []string{root})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, res.DanglingRefs)
+	assert.Equal(t, []string{root}, res.BrokenRoots)
+
+	// What the broken link still holds is kept, not collected out from under
+	// the root that maps to it.
+	assert.Equal(t, 0, res.CollectedDirs())
+	assert.True(t, exists(t, filepath.Join(store, ancestor, storage.MemfileName+storage.HeaderSuffix)))
+}
+
+func TestVerifyDisjointRefusesWhenAKeptFileReferencesATrimmedOne(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(2)
+	kept, referenced := id[0], id[1]
+
+	snapshotDir(t, store, referenced, nil, nil)
+	snapshotDir(t, store, kept, nil, []string{referenced})
+
+	err := verifyDisjoint(
+		t.Context(), store,
+		map[node]struct{}{{id: kept, artifact: memfileArtifact}: {}},
+		nil,
+		map[node]struct{}{{id: referenced, artifact: memfileArtifact}: {}},
+	)
+	require.ErrorContains(t, err, "which this pass collects")
+
+	// The other artifact of the same build being trimmed is no conflict.
+	err = verifyDisjoint(
+		t.Context(), store,
+		map[node]struct{}{{id: kept, artifact: memfileArtifact}: {}},
+		nil,
+		map[node]struct{}{{id: referenced, artifact: rootfsArtifact}: {}},
+	)
+	require.NoError(t, err)
+}
+
+// An index entry is a promise that its target is a whole, usable build; one
+// losing a file is no longer that.
+func TestPruneIndexRemovesEntriesForATrimmedBuild(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	cacheDir := t.TempDir()
+
+	target := uuid.NewString()
+	snapshotDir(t, store, target, nil, nil)
+
+	scanned, err := scan(store)
+	require.NoError(t, err)
+
+	indexDir := filepath.Join(cacheDir, "scope-1", "index")
+	require.NoError(t, os.MkdirAll(indexDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(indexDir, "entry"),
+		[]byte(`{"template":{"build_id":"`+target+`"}}`), 0o644))
+
+	pruned, err := pruneIndex(cacheDir, scanned, nil, map[node]struct{}{{id: target, artifact: memfileArtifact}: {}}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, pruned)
+	assert.False(t, exists(t, filepath.Join(indexDir, "entry")))
+}
+
+// Reachability never crosses artifacts: a rootfs header naming a build keeps
+// that build's rootfs, not its memfile.
+func TestClosureFollowsEachArtifactSeparately(t *testing.T) {
+	t.Parallel()
+
+	store := t.TempDir()
+	id := ids(3)
+	viaRootfs, viaMemfile, root := id[0], id[1], id[2]
+
+	snapshotDir(t, store, viaRootfs, nil, nil)
+	snapshotDir(t, store, viaMemfile, nil, nil)
+	snapshotDir(t, store, root, []string{viaRootfs}, []string{viaMemfile})
+
+	scanned, err := scan(store)
+	require.NoError(t, err)
+
+	keep, dangling := closure(scanned, []string{root})
+	assert.Empty(t, dangling)
+	assert.Equal(t, map[node]struct{}{
+		{id: root, artifact: rootfsArtifact}:        {},
+		{id: root, artifact: memfileArtifact}:       {},
+		{id: viaRootfs, artifact: rootfsArtifact}:   {},
+		{id: viaMemfile, artifact: memfileArtifact}: {},
+	}, keep)
 }

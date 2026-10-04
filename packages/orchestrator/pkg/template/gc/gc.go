@@ -21,15 +21,28 @@
 // as Input/output error inside guests. The only sound criterion is transitive
 // reachability from a live root through parsed header mappings, which is what
 // Collect computes.
+//
+// # Per file, not per directory
+//
+// A build's two layered files are reached independently: a rootfs header maps
+// blocks to other builds' rootfs data, a memfile header to other builds' memfile
+// data, never across. Reachability is therefore tracked per (build, file), and a
+// directory that is still reachable through one file loses the other once
+// nothing reaches it. This is what bounds a paused sandbox: each snapshot's
+// rootfs diff stays as a layer under the next, while the memfile of every
+// snapshot but the newest — a guest-sized file — goes as soon as a newer
+// self-contained one exists.
 package gc
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
@@ -100,12 +113,18 @@ type Result struct {
 	// a root whose storage is already gone changes nothing about what is safe
 	// to collect.
 	MissingRoots []string `json:"missingRoots"`
-	// KeptDirs is the size of the reference closure over the roots.
+	// KeptDirs is the number of directories the reference closure over the
+	// roots reaches through at least one of their files.
 	KeptDirs int `json:"keptDirs"`
 	// SkippedRecentDirs were unreachable but younger than MinAge.
 	SkippedRecentDirs int `json:"skippedRecentDirs"`
-	// DanglingRefs counts distinct referenced build IDs with no directory,
-	// reachable from the roots — i.e. broken chains inside the live set.
+	// SkippedRecentFiles counts files of kept directories (one build's rootfs
+	// or memfile, data and header) that were unreachable but younger than
+	// MinAge.
+	SkippedRecentFiles int `json:"skippedRecentFiles"`
+	// DanglingRefs counts distinct referenced (build, file) pairs whose data
+	// file is not in the store, reachable from the roots — i.e. broken chains
+	// inside the live set.
 	DanglingRefs int `json:"danglingRefs"`
 	// BrokenRoots are roots whose closure contains a dangling reference. They
 	// are kept (a broken root is still a root); this is the inventory the
@@ -113,7 +132,10 @@ type Result struct {
 	BrokenRoots []string `json:"brokenRoots"`
 
 	Collected []CollectedDir `json:"collected"`
-	// FreedBytes is apparent size — the sum of stat sizes — which reads about
+	// Trimmed are files collected out of directories that stay, because the
+	// build is still reachable through its other file.
+	Trimmed []TrimmedFiles `json:"trimmed"`
+	// FreedBytes, for whole directories and trimmed files alike, is apparent size — the sum of stat sizes — which reads about
 	// 1.8% above what df gives back, because rootfs.ext4 is sparse. It is what
 	// the store charges you for on paper, not what the filesystem returns.
 	FreedBytes       uint64 `json:"freedBytes"`
@@ -122,12 +144,25 @@ type Result struct {
 	LedgerPath string `json:"-"`
 }
 
+// TrimmedFiles is one file of a kept build — its data and its header —
+// reclaimed because nothing reaches it any more.
+type TrimmedFiles struct {
+	BuildID string   `json:"buildID"`
+	Files   []string `json:"files"`
+	Bytes   uint64   `json:"bytes"`
+}
+
 // CollectedDirs is the number of directories collected.
 func (r *Result) CollectedDirs() int { return len(r.Collected) }
 
+// TrimmedDirs is the number of kept directories that lost a file.
+func (r *Result) TrimmedDirs() int { return len(r.Trimmed) }
+
 // Collect commits a collection pass: it prunes build-cache index entries that
 // can no longer resolve to a usable layer, and renames every build directory
-// not transitively reachable from roots into the trash staging directory. Both
+// not transitively reachable from roots into the trash staging directory — and,
+// out of a directory that is reachable, the files of the one layered file
+// (rootfs or memfile) nothing reaches. Both
 // are O(1)-per-entry, so a caller holding a lock against concurrent builds can
 // hold it across exactly this call.
 //
@@ -160,6 +195,7 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 		MissingRoots:  []string{},
 		BrokenRoots:   []string{},
 		Collected:     []CollectedDir{},
+		Trimmed:       []TrimmedFiles{},
 	}
 
 	// A trash directory left by a run that died between the rename and the
@@ -176,7 +212,8 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 	res.ScannedDirs = len(store)
 
 	keep, dangling := closure(store, roots)
-	res.KeptDirs = len(keep)
+	keptDirs := dirsOf(keep)
+	res.KeptDirs = len(keptDirs)
 	res.DanglingRefs = len(dangling)
 
 	for _, r := range roots {
@@ -196,27 +233,49 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 
 	cutoff := now().Add(-cfg.MinAge)
 	collect := make(map[string]struct{})
+	trim := make(map[node]struct{})
 
 	for id, d := range store {
-		if _, kept := keep[id]; kept {
+		if _, kept := keptDirs[id]; !kept {
+			if d.modTime.After(cutoff) {
+				res.SkippedRecentDirs++
+
+				continue
+			}
+
+			collect[id] = struct{}{}
+
 			continue
 		}
 
-		if d.modTime.After(cutoff) {
-			res.SkippedRecentDirs++
+		for _, a := range artifacts {
+			f := d.files[a]
+			if len(f.names) == 0 {
+				continue
+			}
 
-			continue
+			if _, kept := keep[node{id: id, artifact: a}]; kept {
+				continue
+			}
+
+			// The same floor as for directories: a file written moments ago
+			// may belong to a build whose root this pass could not see yet.
+			if f.modTime.After(cutoff) {
+				res.SkippedRecentFiles++
+
+				continue
+			}
+
+			trim[node{id: id, artifact: a}] = struct{}{}
 		}
-
-		collect[id] = struct{}{}
 	}
 
-	// Independent re-verification: re-read every kept directory's headers from
-	// disk and re-check each reference against the collect set. This does not
+	// Independent re-verification: re-read every kept file's header from disk
+	// and re-check each reference against what this pass takes. This does not
 	// trust the closure computed above — it is the check that turns "the
 	// closure should not overlap the collect set" into something the run
 	// proves before it deletes anything.
-	if err := verifyDisjoint(ctx, cfg.TemplateStorageDir, keep, collect); err != nil {
+	if err := verifyDisjoint(ctx, cfg.TemplateStorageDir, keep, collect, trim); err != nil {
 		return nil, err
 	}
 
@@ -227,12 +286,22 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 
 	sort.Slice(res.Collected, func(i, j int) bool { return res.Collected[i].BuildID < res.Collected[j].BuildID })
 
+	for n := range trim {
+		f := store[n.id].files[n.artifact]
+		res.Trimmed = append(res.Trimmed, TrimmedFiles{BuildID: n.id, Files: f.names, Bytes: f.bytes})
+		res.FreedBytes += f.bytes
+	}
+
+	slices.SortFunc(res.Trimmed, func(a, b TrimmedFiles) int {
+		return cmp.Or(cmp.Compare(a.BuildID, b.BuildID), cmp.Compare(a.Files[0], b.Files[0]))
+	})
+
 	// Index blobs are pruned BEFORE the directories move. A crash between the
 	// two can then only leave "index entry gone, directory present" — a cache
 	// miss, costing a rebuild. The reverse order leaves "index entry live,
 	// directory gone", which is a cache *hit* onto nothing and reintroduces
 	// the silent-corruption failure this package exists to end.
-	pruned, err := pruneIndex(cfg.BuildCacheDir, store, collect, cfg.DryRun)
+	pruned, err := pruneIndex(cfg.BuildCacheDir, store, collect, trim, cfg.DryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +309,7 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 	res.PrunedIndexBlobs = pruned
 
 	if !cfg.DryRun {
-		if err := stage(cfg.TemplateStorageDir, collect); err != nil {
+		if err := stage(cfg.TemplateStorageDir, store, collect, trim); err != nil {
 			return nil, err
 		}
 	}
@@ -254,9 +323,53 @@ func Collect(ctx context.Context, cfg Config, roots []string) (*Result, error) {
 	return res, nil
 }
 
+// artifact is one of a build's two layered files. Each is a data file plus a
+// header mapping its blocks to the builds that hold them, and a header only
+// ever maps to the same artifact of other builds.
+type artifact int
+
+const (
+	rootfsArtifact artifact = iota
+	memfileArtifact
+)
+
+var artifacts = [...]artifact{rootfsArtifact, memfileArtifact}
+
+// dataName is the artifact's data file, which is also how it is named in
+// errors and the trash.
+func (a artifact) dataName() string {
+	if a == memfileArtifact {
+		return storage.MemfileName
+	}
+
+	return storage.RootfsName
+}
+
+func (a artifact) headerName() string { return a.dataName() + storage.HeaderSuffix }
+
+// node is one artifact of one build: the unit reachability is computed over.
+type node struct {
+	id       string
+	artifact artifact
+}
+
+func (n node) String() string { return n.id + "/" + n.artifact.dataName() }
+
+// artifactFiles is what a build directory holds of one artifact.
+type artifactFiles struct {
+	// refs are the other builds the header maps blocks to; the same artifact
+	// of each is what this one reads.
+	refs map[string]struct{}
+	// names are the artifact's files present: data, header, or both.
+	names   []string
+	hasData bool
+	bytes   uint64
+	modTime time.Time
+}
+
 // dirInfo is one build directory as found on disk.
 type dirInfo struct {
-	refs    map[string]struct{}
+	files   [len(artifacts)]artifactFiles
 	bytes   uint64
 	modTime time.Time
 }
@@ -309,10 +422,26 @@ func readDir(storeDir, buildID string) (*dirInfo, error) {
 			return nil, fmt.Errorf("failed to stat %q: %w", filepath.Join(path, f.Name()), err)
 		}
 
-		d.bytes += uint64(info.Size())
+		size := uint64(info.Size())
+		d.bytes += size
 
 		if info.ModTime().After(d.modTime) {
 			d.modTime = info.ModTime()
+		}
+
+		for _, a := range artifacts {
+			if f.Name() != a.dataName() && f.Name() != a.headerName() {
+				continue
+			}
+
+			af := &d.files[a]
+			af.names = append(af.names, f.Name())
+			af.bytes += size
+			af.hasData = af.hasData || f.Name() == a.dataName()
+
+			if info.ModTime().After(af.modTime) {
+				af.modTime = info.ModTime()
+			}
 		}
 	}
 
@@ -320,129 +449,161 @@ func readDir(storeDir, buildID string) (*dirInfo, error) {
 		d.modTime = info.ModTime()
 	}
 
-	refs, err := readRefs(path)
-	if err != nil {
-		return nil, err
-	}
+	for _, a := range artifacts {
+		refs, err := readRefs(path, a)
+		if err != nil {
+			return nil, err
+		}
 
-	d.refs = refs
+		d.files[a].refs = refs
+	}
 
 	return d, nil
 }
 
-// readRefs returns every *external* build ID named by the block mappings of a
-// build's headers — the layers it pages from. A missing header contributes
-// nothing: an intermediate layer under the leaf-only snapshot policy has no
-// memfile header at all. A header that exists but cannot be parsed is fatal —
-// a closure computed over a header we could not read is a guess, and guessing
-// is what this package refuses to do.
-func readRefs(dir string) (map[string]struct{}, error) {
+// readRefs returns every *external* build ID named by the block mappings of
+// one of a build's headers — the builds whose same artifact it pages from. A
+// missing header contributes nothing: an intermediate layer under the leaf-only
+// snapshot policy has no memfile header at all. A header that exists but cannot
+// be parsed is fatal — a closure computed over a header we could not read is a
+// guess, and guessing is what this package refuses to do.
+func readRefs(dir string, a artifact) (map[string]struct{}, error) {
 	self := filepath.Base(dir)
 	refs := make(map[string]struct{})
 
-	for _, name := range []string{
-		storage.RootfsName + storage.HeaderSuffix,
-		storage.MemfileName + storage.HeaderSuffix,
-	} {
-		path := filepath.Join(dir, name)
+	path := filepath.Join(dir, a.headerName())
 
-		data, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return refs, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to read header %q: %w", path, err)
+	}
+
+	h, err := header.DeserializeBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse header %q: %w", path, err)
+	}
+
+	for _, m := range h.Mapping {
+		if m.BuildId == uuid.Nil {
+			// The sentinel for empty blocks, not a reference.
 			continue
 		}
 
-		if err != nil {
-			return nil, fmt.Errorf("failed to read header %q: %w", path, err)
+		id := m.BuildId.String()
+		if id == self {
+			continue
 		}
 
-		h, err := header.DeserializeBytes(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse header %q: %w", path, err)
-		}
-
-		for _, m := range h.Mapping {
-			if m.BuildId == uuid.Nil {
-				// The sentinel for empty blocks, not a reference.
-				continue
-			}
-
-			id := m.BuildId.String()
-			if id == self {
-				continue
-			}
-
-			refs[id] = struct{}{}
-		}
+		refs[id] = struct{}{}
 	}
 
 	return refs, nil
 }
 
-// closure returns the set of directories reachable from seeds, and the distinct
-// referenced build IDs that have no directory (dangling references — broken
-// chains, which page-fault as Input/output error inside a guest).
-func closure(store map[string]*dirInfo, seeds []string) (keep map[string]struct{}, dangling map[string]struct{}) {
-	keep = make(map[string]struct{}, len(seeds))
-	dangling = make(map[string]struct{})
+// closure returns the (build, artifact) pairs reachable from the seed builds —
+// every artifact of a seed, and transitively the same artifact of each build
+// its header maps to — and the referenced pairs whose data file is not in the
+// store (dangling references — broken chains, which page-fault as Input/output
+// error inside a guest). A dangling pair whose directory exists is kept all the
+// same.
+func closure(store map[string]*dirInfo, seeds []string) (keep map[node]struct{}, dangling map[node]struct{}) {
+	keep = make(map[node]struct{}, len(seeds)*len(artifacts))
+	dangling = make(map[node]struct{})
 
-	var frontier []string
+	var frontier []node
 
 	for _, s := range seeds {
 		if _, ok := store[s]; !ok {
 			continue
 		}
 
-		if _, seen := keep[s]; seen {
-			continue
-		}
+		for _, a := range artifacts {
+			n := node{id: s, artifact: a}
+			if _, seen := keep[n]; seen {
+				continue
+			}
 
-		keep[s] = struct{}{}
-		frontier = append(frontier, s)
+			keep[n] = struct{}{}
+			frontier = append(frontier, n)
+		}
 	}
 
 	for len(frontier) > 0 {
-		id := frontier[len(frontier)-1]
+		n := frontier[len(frontier)-1]
 		frontier = frontier[:len(frontier)-1]
 
-		for ref := range store[id].refs {
-			if _, ok := store[ref]; !ok {
-				dangling[ref] = struct{}{}
+		for ref := range store[n.id].files[n.artifact].refs {
+			r := node{id: ref, artifact: n.artifact}
+
+			d, ok := store[ref]
+			if !ok {
+				dangling[r] = struct{}{}
 
 				continue
 			}
 
-			if _, seen := keep[ref]; seen {
+			// A directory that lacks the data file is a broken chain too, but
+			// what it does hold stays: a pass never makes a broken chain worse.
+			if !d.files[n.artifact].hasData {
+				dangling[r] = struct{}{}
+			}
+
+			if _, seen := keep[r]; seen {
 				continue
 			}
 
-			keep[ref] = struct{}{}
-			frontier = append(frontier, ref)
+			keep[r] = struct{}{}
+			frontier = append(frontier, r)
 		}
 	}
 
 	return keep, dangling
 }
 
-// verifyDisjoint re-reads the headers of every kept directory and fails if any
-// of them references a directory in the collect set.
-func verifyDisjoint(ctx context.Context, storeDir string, keep, collect map[string]struct{}) error {
-	for id := range keep {
+// dirsOf returns the builds that have at least one artifact in nodes.
+func dirsOf(nodes map[node]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(nodes))
+	for n := range nodes {
+		out[n.id] = struct{}{}
+	}
+
+	return out
+}
+
+// verifyDisjoint re-reads the header of every kept (build, artifact) and fails
+// if it is itself being taken, or references a directory in the collect set or
+// an artifact being trimmed.
+func verifyDisjoint(ctx context.Context, storeDir string, keep map[node]struct{}, collect map[string]struct{}, trim map[node]struct{}) error {
+	for n := range keep {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		if _, bad := collect[id]; bad {
-			return fmt.Errorf("gc integrity check failed: build %s is both kept and collected", id)
+		if _, bad := collect[n.id]; bad {
+			return fmt.Errorf("gc integrity check failed: build %s is both kept and collected", n.id)
 		}
 
-		refs, err := readRefs(filepath.Join(storeDir, id))
+		if _, bad := trim[n]; bad {
+			return fmt.Errorf("gc integrity check failed: %s is both kept and collected", n)
+		}
+
+		refs, err := readRefs(filepath.Join(storeDir, n.id), n.artifact)
 		if err != nil {
 			return err
 		}
 
 		for ref := range refs {
 			if _, bad := collect[ref]; bad {
-				return fmt.Errorf("gc integrity check failed: kept build %s references collect-set build %s", id, ref)
+				return fmt.Errorf("gc integrity check failed: kept %s references collect-set build %s", n, ref)
+			}
+
+			r := node{id: ref, artifact: n.artifact}
+			if _, bad := trim[r]; bad {
+				return fmt.Errorf("gc integrity check failed: kept %s references %s, which this pass collects", n, r)
 			}
 		}
 	}
@@ -450,12 +611,12 @@ func verifyDisjoint(ctx context.Context, storeDir string, keep, collect map[stri
 	return nil
 }
 
-// stage renames every collected directory into the trash staging directory.
-// The rename is O(1) per directory and same-filesystem, which is what lets the
-// caller hold its build lock across the commit and release it before the much
-// slower removal.
-func stage(storeDir string, collect map[string]struct{}) error {
-	if len(collect) == 0 {
+// stage renames every collected directory, and the files of every trimmed
+// artifact, into the trash staging directory. The rename is O(1) per entry and
+// same-filesystem, which is what lets the caller hold its build lock across the
+// commit and release it before the much slower removal.
+func stage(storeDir string, store map[string]*dirInfo, collect map[string]struct{}, trim map[node]struct{}) error {
+	if len(collect) == 0 && len(trim) == 0 {
 		return nil
 	}
 
@@ -469,6 +630,21 @@ func stage(storeDir string, collect map[string]struct{}) error {
 
 		if err := os.Rename(src, filepath.Join(trash, id)); err != nil {
 			return fmt.Errorf("failed to stage %q for collection: %w", src, err)
+		}
+	}
+
+	for n := range trim {
+		dst := filepath.Join(trash, n.id+"."+n.artifact.dataName())
+		if err := os.MkdirAll(dst, 0o700); err != nil {
+			return fmt.Errorf("failed to create gc trash dir %q: %w", dst, err)
+		}
+
+		for _, name := range store[n.id].files[n.artifact].names {
+			src := filepath.Join(storeDir, n.id, name)
+
+			if err := os.Rename(src, filepath.Join(dst, name)); err != nil {
+				return fmt.Errorf("failed to stage %q for collection: %w", src, err)
+			}
 		}
 	}
 
@@ -496,8 +672,9 @@ type indexEntry struct {
 }
 
 // pruneIndex removes build-cache index blobs that can no longer resolve to a
-// usable cached layer: the directory is gone, is being collected, or is present
-// but has a dangling reference somewhere in its own chain.
+// usable cached layer: the directory is gone, is being collected, is losing one
+// of its files, or is present but has a dangling reference somewhere in its own
+// chain.
 //
 // The third case is an inference, and it is safe *here* in a way it would never
 // be for deletion: the worst outcome of pruning a good entry is a cache miss
@@ -506,7 +683,7 @@ type indexEntry struct {
 // ordinary collection takes the broken one away. Leaving such an entry in place
 // is the state the 2026-08-01 write-up called the worst of both: a cache hit
 // onto a directory that faults.
-func pruneIndex(buildCacheDir string, store map[string]*dirInfo, collect map[string]struct{}, dryRun bool) (int, error) {
+func pruneIndex(buildCacheDir string, store map[string]*dirInfo, collect map[string]struct{}, trim map[node]struct{}, dryRun bool) (int, error) {
 	if buildCacheDir == "" {
 		return 0, nil
 	}
@@ -526,7 +703,8 @@ func pruneIndex(buildCacheDir string, store map[string]*dirInfo, collect map[str
 	// it on the pre-collection view leaves its index entry in place — a cache
 	// hit onto a chain that faults, which is the exact state this prune exists
 	// to prevent.
-	broken := brokenDirs(store, collect)
+	broken := brokenDirs(store, collect, trim)
+	trimmed := dirsOf(trim)
 	pruned := 0
 
 	for _, scope := range scopes {
@@ -559,9 +737,10 @@ func pruneIndex(buildCacheDir string, store map[string]*dirInfo, collect map[str
 
 			_, present := store[target]
 			_, collected := collect[target]
+			_, isTrimmed := trimmed[target]
 			_, isBroken := broken[target]
 
-			if present && !collected && !isBroken {
+			if present && !collected && !isTrimmed && !isBroken {
 				continue
 			}
 
@@ -601,21 +780,27 @@ func indexTarget(path string) (string, error) {
 	return entry.Template.BuildID, nil
 }
 
-// brokenDirs returns every directory whose own transitive closure contains a
-// dangling reference, evaluated against the store as it will be once the
-// directories in collect are gone. Callers judging the store after a pass want
-// that view; passing a nil collect gives the present one.
-func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[string]struct{} {
-	// present reports whether a referenced directory will still be there when
-	// the pass has committed.
-	present := func(id string) bool {
-		if _, ok := store[id]; !ok {
+// brokenDirs returns every directory with an artifact whose own transitive
+// closure contains a dangling reference, evaluated against the store as it will
+// be once the directories in collect and the artifacts in trim are gone. Callers
+// judging the store after a pass want that view; passing nil for both gives the
+// present one.
+func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}, trim map[node]struct{}) map[string]struct{} {
+	// present reports whether a referenced artifact's data will still be there
+	// when the pass has committed.
+	present := func(n node) bool {
+		d, ok := store[n.id]
+		if !ok || !d.files[n.artifact].hasData {
 			return false
 		}
 
-		_, collected := collect[id]
+		if _, collected := collect[n.id]; collected {
+			return false
+		}
 
-		return !collected
+		_, trimmed := trim[n]
+
+		return !trimmed
 	}
 
 	const (
@@ -625,12 +810,12 @@ func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[stri
 		broken
 	)
 
-	state := make(map[string]int, len(store))
+	state := make(map[node]int, len(store)*len(artifacts))
 
-	var walk func(id string) bool
+	var walk func(n node) bool
 
-	walk = func(id string) bool {
-		switch state[id] {
+	walk = func(n node) bool {
+		switch state[n] {
 		case broken:
 			return true
 		case intact, visiting:
@@ -639,18 +824,20 @@ func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[stri
 			return false
 		}
 
-		state[id] = visiting
+		state[n] = visiting
 
 		result := false
 
-		for ref := range store[id].refs {
-			if !present(ref) {
+		for ref := range store[n.id].files[n.artifact].refs {
+			r := node{id: ref, artifact: n.artifact}
+
+			if !present(r) {
 				result = true
 
 				break
 			}
 
-			if walk(ref) {
+			if walk(r) {
 				result = true
 
 				break
@@ -658,9 +845,9 @@ func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[stri
 		}
 
 		if result {
-			state[id] = broken
+			state[n] = broken
 		} else {
-			state[id] = intact
+			state[n] = intact
 		}
 
 		return result
@@ -669,8 +856,10 @@ func brokenDirs(store map[string]*dirInfo, collect map[string]struct{}) map[stri
 	out := make(map[string]struct{})
 
 	for id := range store {
-		if walk(id) {
-			out[id] = struct{}{}
+		for _, a := range artifacts {
+			if walk(node{id: id, artifact: a}) {
+				out[id] = struct{}{}
+			}
 		}
 	}
 

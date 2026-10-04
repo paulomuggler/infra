@@ -39,11 +39,11 @@ type BuilderConfig struct {
 	// admitted. Set to 0 to disable the guard. See pkg/diskguard.
 	TemplateBuildMinFreeDiskGB int64 `env:"TEMPLATE_BUILD_MIN_FREE_DISK_GB" envDefault:"50"`
 
-	// TemplateGCMinAge protects build directories modified more recently than
-	// this from storage GC. It covers intermediate layer directories minted by
-	// a build the orchestrator has since forgotten — a crash or a restart
-	// mid-build — which no root references and no in-flight build claims. See
-	// pkg/template/gc.
+	// TemplateGCMinAge protects build directories, and the rootfs or memfile
+	// files of kept ones, modified more recently than this from storage GC. It
+	// covers intermediate layer directories minted by a build the orchestrator
+	// has since forgotten — a crash or a restart mid-build — which no root
+	// references and no in-flight build claims. See pkg/template/gc.
 	TemplateGCMinAge time.Duration `env:"TEMPLATE_GC_MIN_AGE" envDefault:"2h"`
 
 	// TemplateSnapshotPolicy is the host-wide default for which of a build's
