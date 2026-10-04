@@ -32,6 +32,7 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/handlers"
 	customMiddleware "github.com/e2b-dev/infra/packages/api/internal/middleware"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/ratelimit"
+	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
@@ -64,6 +65,11 @@ const (
 	// server's write deadline kills the connection (WriteTimeout does NOT
 	// cancel r.Context(); see https://github.com/golang/go/issues/59602).
 	requestTimeout = 70 * time.Second
+
+	// pauseRequestTimeout lets a pause request wait out the pause itself,
+	// which runs detached under its own orchestrator.PauseTimeout; the margin
+	// covers the lookups around it.
+	pauseRequestTimeout = orchestrator.PauseTimeout + 30*time.Second
 
 	// This timeout should be > 600 (GCP LB upstream idle timeout) to prevent race condition
 	// https://cloud.google.com/load-balancing/docs/https#timeouts_and_retries%23:~:text=The%20load%20balancer%27s%20backend%20keepalive,is%20greater%20than%20600%20seconds
@@ -133,7 +139,7 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 			},
 		}),
 		gin.Recovery(),
-		sharedmiddleware.RequestTimeout(requestTimeout), //nolint:contextcheck // Gin middleware sets context via c.Request.WithContext
+		sharedmiddleware.RequestTimeout(requestTimeout, sharedmiddleware.RouteTimeout{Route: "/sandboxes/:sandboxID/pause", Timeout: pauseRequestTimeout}), //nolint:contextcheck // Gin middleware sets context via c.Request.WithContext
 	)
 
 	corsConfig := cors.DefaultConfig()

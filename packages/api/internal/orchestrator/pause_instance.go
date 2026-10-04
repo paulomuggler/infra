@@ -21,6 +21,11 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
+// PauseTimeout bounds a pause end to end, independently of whoever asked for
+// it (see RemoveSandbox). The snapshot copies all of the guest's RAM plus its
+// disk diff: a 12 GB sandbox under IO contention has taken over 4 minutes.
+const PauseTimeout = 10 * time.Minute
+
 type PauseQueueExhaustedError struct{}
 
 func (PauseQueueExhaustedError) Error() string {
@@ -38,14 +43,24 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node,
 		return err
 	}
 
+	// Whichever way the pause ends, the new build is now the sandbox's latest
+	// snapshot, so a cached earlier one is stale.
+	defer o.snapshotCache.Invalidate(context.WithoutCancel(ctx), sbx.SandboxID)
+
 	err = snapshotInstance(ctx, node, sbx, result.TemplateID, result.BuildID.String())
-	if errors.Is(err, PauseQueueExhaustedError{}) {
-		telemetry.ReportCriticalError(ctx, "pause queue exhausted", err)
+	if err != nil {
+		// The orchestrator stops the VM whether or not its snapshot landed, so
+		// this build stands for the sandbox's state from now on. Mark it failed
+		// (never leave it 'snapshotting'): resume then refuses it rather than
+		// falling back to an older snapshot. ctx may be past its deadline.
+		o.failSnapshotBuild(context.WithoutCancel(ctx), result.BuildID, err)
 
-		return PauseQueueExhaustedError{}
-	}
+		if errors.Is(err, PauseQueueExhaustedError{}) {
+			telemetry.ReportCriticalError(ctx, "pause queue exhausted", err)
 
-	if err != nil && !errors.Is(err, PauseQueueExhaustedError{}) {
+			return PauseQueueExhaustedError{}
+		}
+
 		telemetry.ReportCriticalError(ctx, "error pausing sandbox", err)
 
 		return fmt.Errorf("error pausing sandbox: %w", err)
@@ -63,8 +78,6 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node,
 
 		return fmt.Errorf("error pausing sandbox: %w", err)
 	}
-
-	o.snapshotCache.Invalidate(context.WithoutCancel(ctx), sbx.SandboxID)
 
 	return nil
 }

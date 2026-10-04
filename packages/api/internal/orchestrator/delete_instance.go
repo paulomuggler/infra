@@ -19,6 +19,16 @@ import (
 )
 
 func (o *Orchestrator) RemoveSandbox(ctx context.Context, teamID uuid.UUID, sandboxID string, opts sandbox.RemoveOpts) error {
+	if opts.Action == sandbox.StateActionPause {
+		// A pause must not be cut short by its caller: the orchestrator stops
+		// the VM whether or not the snapshot lands, so abandoning it midway (an
+		// HTTP request deadline, a client hanging up) loses the sandbox's state.
+		// Detach it from the caller and bound it on its own.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), PauseTimeout)
+		defer cancel()
+	}
+
 	ctx, span := tracer.Start(ctx, "remove-sandbox")
 	defer span.End()
 

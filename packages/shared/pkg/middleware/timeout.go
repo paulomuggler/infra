@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +36,17 @@ func CancelCause(c *gin.Context) error {
 // It is not an official IANA code but is widely recognised in logs and metrics.
 const StatusClientClosedRequest = 499
 
+// writeDeadlineMargin is how far past a route's own timeout its response write
+// deadline is pushed, so the context cancels before the connection is cut.
+const writeDeadlineMargin = 5 * time.Second
+
+// RouteTimeout gives one route (a gin route pattern, as c.FullPath() reports
+// it) its own request timeout in place of the default.
+type RouteTimeout struct {
+	Route   string
+	Timeout time.Duration
+}
+
 // RequestTimeout returns a Gin middleware that sets a context deadline on each
 // request. This is needed because http.Server.WriteTimeout does NOT cancel
 // r.Context() (see https://github.com/golang/go/issues/59602), so without an
@@ -47,11 +59,25 @@ const StatusClientClosedRequest = 499
 //   - server-side timeout (cause is ErrRequestTimeout)  → 408 Request Timeout
 //   - client disconnect (ctx.Err() == context.Canceled) → 499 Client Closed Request
 //
-// Routes matching any of the excludedRoutes patterns are skipped (useful for
-// health checks and long-polling endpoints).
-func RequestTimeout(timeout time.Duration) gin.HandlerFunc {
+// Routes listed in overrides get their own timeout instead, and their response
+// write deadline is pushed out to match it: the server's WriteTimeout would
+// otherwise cut the connection before a long handler can answer.
+func RequestTimeout(timeout time.Duration, overrides ...RouteTimeout) gin.HandlerFunc {
+	routeTimeouts := make(map[string]time.Duration, len(overrides))
+	for _, o := range overrides {
+		routeTimeouts[o.Route] = o.Timeout
+	}
+
 	return func(c *gin.Context) {
-		ctx, cancel := context.WithTimeoutCause(c.Request.Context(), timeout, ErrRequestTimeout)
+		t := timeout
+		if routeTimeout, ok := routeTimeouts[c.FullPath()]; ok {
+			t = routeTimeout
+			// Only writers that are not a net/http connection (test
+			// recorders) lack write deadlines; there is nothing to extend.
+			_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(t + writeDeadlineMargin))
+		}
+
+		ctx, cancel := context.WithTimeoutCause(c.Request.Context(), t, ErrRequestTimeout)
 		defer cancel()
 
 		c.Request = c.Request.WithContext(ctx)
