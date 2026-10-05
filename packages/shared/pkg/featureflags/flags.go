@@ -161,8 +161,12 @@ var (
 	MaxCacheWriterConcurrencyFlag = newIntFlag("max-cache-writer-concurrency", 10)
 
 	// BuildCacheMaxUsagePercentage the maximum percentage of the cache disk storage
-	// that can be used before the cache starts evicting items.
-	BuildCacheMaxUsagePercentage = newIntFlag("build-cache-max-usage-percentage", 85)
+	// that can be used before the cache starts evicting items. 70, not upstream 85
+	// (Taskmill, 2026-10-05): the chunk cache fills free space to this mark by design,
+	// so at 85 the root disk idled at 81-86% and left little headroom for a 12 GB
+	// stack first pause (~26 GB) or template builds. LaunchDarkly runs offline here,
+	// so this default IS the value.
+	BuildCacheMaxUsagePercentage = newIntFlag("build-cache-max-usage-percentage", 70)
 	BuildProvisionVersion        = newIntFlag("build-provision-version", 0)
 
 	// NBDConnectionsPerDevice the number of NBD socket connections per device
